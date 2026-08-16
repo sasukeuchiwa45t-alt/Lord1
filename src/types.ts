@@ -95,6 +95,13 @@ export type ReportStatus = 'pending' | 'reviewed' | 'dismissed' | 'actioned';
 
 export type CloudSyncState = 'synced' | 'syncing' | 'offline' | 'error';
 
+export interface PaginatedProjectsResult {
+  projects: Project[];
+  hasMore: boolean;
+  lastDocSnapshot: any | null;
+  totalEstimate?: number;
+}
+
 export interface ProjectReport {
   id: string;
   projectId: string;

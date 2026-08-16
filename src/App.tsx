@@ -23,6 +23,7 @@ import { ReportModal } from './components/ReportModal';
 import { ToastProvider, useToast } from './components/Toast';
 import { 
   getProjects, 
+  getPaginatedProjects,
   subscribeToProjects,
   subscribeToAuth, 
   logoutUser 
@@ -38,7 +39,9 @@ import {
   Search,
   CheckCircle2,
   Calendar,
-  Upload
+  Upload,
+  RefreshCw,
+  ChevronDown
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 
@@ -70,6 +73,10 @@ function MainApp() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
   const [publishModalOpen, setPublishModalOpen] = useState(false);
+
+  // Pagination & Cursor State
+  const [pageSize, setPageSize] = useState(12);
+  const [loadingMore, setLoadingMore] = useState(false);
 
   // Live Real-Time Projects & Auth Subscriptions
   useEffect(() => {
@@ -509,15 +516,51 @@ function MainApp() {
                 ))}
               </div>
             ) : filteredProjects.length > 0 ? (
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {filteredProjects.map((project, idx) => (
-                  <ProjectCard
-                    key={project.id}
-                    project={project}
-                    onSelect={setSelectedProject}
-                    index={idx}
-                  />
-                ))}
+              <div className="space-y-8">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                  {filteredProjects.slice(0, pageSize).map((project, idx) => (
+                    <ProjectCard
+                      key={project.id}
+                      project={project}
+                      onSelect={setSelectedProject}
+                      index={idx}
+                    />
+                  ))}
+                </div>
+
+                {/* Pagination / Charger Plus Controls */}
+                {filteredProjects.length > pageSize && (
+                  <div className="pt-6 pb-2 flex flex-col items-center justify-center gap-3">
+                    <div className="text-xs text-zinc-400 font-mono">
+                      Affichage de <span className="text-cyan-400 font-semibold">{Math.min(pageSize, filteredProjects.length)}</span> sur <span className="text-white font-semibold">{filteredProjects.length}</span> projets
+                    </div>
+
+                    <button
+                      id="load-more-projects-btn"
+                      onClick={() => {
+                        setLoadingMore(true);
+                        setTimeout(() => {
+                          setPageSize((prev) => prev + 12);
+                          setLoadingMore(false);
+                        }, 200);
+                      }}
+                      disabled={loadingMore}
+                      className="px-6 py-3 rounded-2xl bg-zinc-900 hover:bg-zinc-800 active:scale-95 text-white font-semibold text-sm border border-zinc-700/80 shadow-lg hover:border-cyan-500/50 hover:text-cyan-300 transition-all flex items-center gap-2"
+                    >
+                      {loadingMore ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin text-cyan-400" />
+                          <span>Chargement...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>Charger plus de projets</span>
+                          <ChevronDown className="w-4 h-4 text-cyan-400" />
+                        </>
+                      )}
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
               <div className="p-12 rounded-3xl bg-zinc-900/40 border border-zinc-800 text-center space-y-3">

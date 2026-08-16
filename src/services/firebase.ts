@@ -27,10 +27,24 @@ import {
   runTransaction,
   query,
   orderBy,
+  where,
+  limit,
+  startAfter,
+  QueryDocumentSnapshot,
+  DocumentData,
   onSnapshot,
   Firestore
 } from 'firebase/firestore';
-import { Project, UserProfile, ProjectReport, ProjectStatus, ReportStatus, CloudSyncState } from '../types';
+import { 
+  Project, 
+  UserProfile, 
+  ProjectReport, 
+  ProjectStatus, 
+  ReportStatus, 
+  CloudSyncState,
+  PaginatedProjectsResult,
+  FilterOptions
+} from '../types';
 import { deleteStoredFile } from '../utils/fileStorage';
 
 const firebaseConfig = {
@@ -609,7 +623,7 @@ export async function getProjects(): Promise<Project[]> {
 
   try {
     updateSyncStatus('syncing');
-    const q = query(collection(db, 'projects'), orderBy('createdAt', 'desc'));
+    const q = query(collection(db, 'projects'), orderBy('createdAt', 'desc'), limit(50));
     const snapshot = await getDocs(q);
     if (snapshot) {
       const fetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Project));
@@ -624,6 +638,186 @@ export async function getProjects(): Promise<Project[]> {
   }
 
   return getLocalProjects();
+}
+
+export interface FetchPaginatedOptions {
+  pageSize?: number;
+  lastDoc?: QueryDocumentSnapshot<DocumentData> | null;
+  filters?: Partial<FilterOptions>;
+  isAdmin?: boolean;
+  userId?: string;
+}
+
+/**
+ * Server-side Firestore pagination with cursor (startAfter) and compound filters.
+ * Capable of scaling effortlessly from 1,000 to 100,000+ projects without downloading full collections.
+ */
+export async function getPaginatedProjects(
+  options: FetchPaginatedOptions = {}
+): Promise<PaginatedProjectsResult> {
+  const {
+    pageSize = 12,
+    lastDoc = null,
+    filters = {},
+    isAdmin = false,
+    userId = '',
+  } = options;
+
+  if (!db || !isFirebaseConfigured()) {
+    // Client-side fallback pagination over local cache
+    updateSyncStatus('offline');
+    const all = getLocalProjects().filter(p => {
+      if (isAdmin) return true;
+      if (p.status === 'hidden') return p.ownerId === userId;
+      return p.status === 'published' || !p.status;
+    });
+
+    let filtered = [...all];
+    if (filters.category && filters.category !== 'all') {
+      filtered = filtered.filter(p => p.category === filters.category);
+    }
+    if (filters.technology && filters.technology !== 'all') {
+      const techLower = filters.technology.toLowerCase();
+      filtered = filtered.filter(p => p.technologies.some(t => t.toLowerCase() === techLower));
+    }
+    if (filters.tag && filters.tag !== 'all') {
+      const tagLower = filters.tag.toLowerCase();
+      filtered = filtered.filter(p => p.tags.some(t => t.toLowerCase() === tagLower));
+    }
+    if (filters.search && filters.search.trim()) {
+      const q = filters.search.toLowerCase().trim();
+      filtered = filtered.filter(p => 
+        p.name.toLowerCase().includes(q) ||
+        p.developerName.toLowerCase().includes(q) ||
+        (p.shortDescription && p.shortDescription.toLowerCase().includes(q)) ||
+        p.description.toLowerCase().includes(q) ||
+        p.technologies.some(t => t.toLowerCase().includes(q)) ||
+        p.tags.some(t => t.toLowerCase().includes(q))
+      );
+    }
+
+    filtered.sort((a, b) => {
+      switch (filters.sortBy) {
+        case 'downloads':
+          return (b.downloads || 0) - (a.downloads || 0);
+        case 'popular':
+          return ((b.downloads || 0) * 3 + (b.views || 0)) - ((a.downloads || 0) * 3 + (a.views || 0));
+        case 'oldest':
+          return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+        case 'alpha':
+          return a.name.localeCompare(b.name);
+        case 'recent':
+        default:
+          return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      }
+    });
+
+    return {
+      projects: filtered.slice(0, pageSize),
+      hasMore: filtered.length > pageSize,
+      lastDocSnapshot: null,
+      totalEstimate: filtered.length
+    };
+  }
+
+  try {
+    updateSyncStatus('syncing');
+    const projectsCol = collection(db, 'projects');
+    const queryConstraints: any[] = [];
+
+    // 1. Status Filter (Public vs Admin)
+    if (!isAdmin) {
+      queryConstraints.push(where('status', '==', 'published'));
+    }
+
+    // 2. Category Filter at query level
+    if (filters.category && filters.category !== 'all') {
+      queryConstraints.push(where('category', '==', filters.category));
+    }
+
+    // 3. Sorting & Order Constraints
+    switch (filters.sortBy) {
+      case 'downloads':
+        queryConstraints.push(orderBy('downloads', 'desc'));
+        queryConstraints.push(orderBy('createdAt', 'desc'));
+        break;
+      case 'oldest':
+        queryConstraints.push(orderBy('createdAt', 'asc'));
+        break;
+      case 'alpha':
+        queryConstraints.push(orderBy('name', 'asc'));
+        queryConstraints.push(orderBy('createdAt', 'desc'));
+        break;
+      case 'popular':
+        // Primary sort on downloads + views fallback
+        queryConstraints.push(orderBy('downloads', 'desc'));
+        queryConstraints.push(orderBy('views', 'desc'));
+        break;
+      case 'recent':
+      default:
+        queryConstraints.push(orderBy('createdAt', 'desc'));
+        break;
+    }
+
+    // 4. Cursor Pagination (startAfter previous DocumentSnapshot)
+    if (lastDoc) {
+      queryConstraints.push(startAfter(lastDoc));
+    }
+
+    // 5. Page Size Limit (fetch +1 to determine hasMore cleanly)
+    queryConstraints.push(limit(pageSize + 1));
+
+    const q = query(projectsCol, ...queryConstraints);
+    const snapshot = await getDocs(q);
+
+    const docs = snapshot.docs;
+    const hasMore = docs.length > pageSize;
+    const validDocs = hasMore ? docs.slice(0, pageSize) : docs;
+    const lastDocSnapshot = validDocs.length > 0 ? validDocs[validDocs.length - 1] : null;
+
+    let pageProjects = validDocs.map(d => ({ id: d.id, ...d.data() } as Project));
+    pageProjects = deduplicateProjects(pageProjects);
+
+    // Apply text search, tag & tech filters if present
+    if (filters.technology && filters.technology !== 'all') {
+      const techLower = filters.technology.toLowerCase();
+      pageProjects = pageProjects.filter(p => p.technologies.some(t => t.toLowerCase() === techLower));
+    }
+    if (filters.tag && filters.tag !== 'all') {
+      const tagLower = filters.tag.toLowerCase();
+      pageProjects = pageProjects.filter(p => p.tags.some(t => t.toLowerCase() === tagLower));
+    }
+    if (filters.search && filters.search.trim()) {
+      const qText = filters.search.toLowerCase().trim();
+      pageProjects = pageProjects.filter(p => 
+        p.name.toLowerCase().includes(qText) ||
+        p.developerName.toLowerCase().includes(qText) ||
+        (p.shortDescription && p.shortDescription.toLowerCase().includes(qText)) ||
+        p.description.toLowerCase().includes(qText) ||
+        p.technologies.some(t => t.toLowerCase().includes(qText)) ||
+        p.tags.some(t => t.toLowerCase().includes(qText))
+      );
+    }
+
+    updateSyncStatus(navigator.onLine ? 'synced' : 'offline');
+
+    return {
+      projects: pageProjects,
+      hasMore,
+      lastDocSnapshot
+    };
+  } catch (err: any) {
+    updateSyncStatus(navigator.onLine ? 'error' : 'offline');
+    console.warn('Firestore getPaginatedProjects network notice, using local cache:', err);
+    
+    // Graceful fallback to local cache
+    const fallbackProjects = getLocalProjects();
+    return {
+      projects: fallbackProjects.slice(0, pageSize),
+      hasMore: fallbackProjects.length > pageSize,
+      lastDocSnapshot: null
+    };
+  }
 }
 
 export async function getProjectById(id: string): Promise<Project | null> {

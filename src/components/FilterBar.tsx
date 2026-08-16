@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Filter, 
   ArrowUpDown, 
@@ -26,6 +26,24 @@ export const FilterBar: React.FC<FilterBarProps> = ({
   onChange,
   totalResults,
 }) => {
+  const [localSearch, setLocalSearch] = useState(filters.search);
+
+  // Sync external search updates to local state
+  useEffect(() => {
+    setLocalSearch(filters.search);
+  }, [filters.search]);
+
+  // Debounce search update to parent state to avoid re-rendering heavy lists on every keystroke
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (localSearch !== filters.search) {
+        onChange({ ...filters, search: localSearch });
+      }
+    }, 200);
+
+    return () => clearTimeout(timer);
+  }, [localSearch, filters, onChange]);
+
   const handleCategoryChange = (category: ProjectCategory | 'all') => {
     onChange({ ...filters, category });
   };
@@ -40,6 +58,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
   };
 
   const clearAllFilters = () => {
+    setLocalSearch('');
     onChange({
       search: '',
       category: 'all',
@@ -51,6 +70,7 @@ export const FilterBar: React.FC<FilterBarProps> = ({
 
   const hasActiveFilters = 
     filters.search !== '' || 
+    localSearch !== '' ||
     filters.category !== 'all' || 
     filters.technology !== 'all' || 
     filters.tag !== 'all' ||
@@ -67,15 +87,20 @@ export const FilterBar: React.FC<FilterBarProps> = ({
           <input
             id="filter-search-input"
             type="text"
-            value={filters.search}
-            onChange={(e) => onChange({ ...filters, search: e.target.value })}
+            value={localSearch}
+            onChange={(e) => setLocalSearch(e.target.value)}
             placeholder="Rechercher par nom, techno, dev, tag..."
-            className="w-full bg-zinc-950 text-sm text-white placeholder-zinc-500 pl-10 pr-9 py-2 rounded-xl border border-zinc-800 focus:outline-none focus:border-cyan-500/60"
+            className="w-full bg-zinc-950 text-sm text-white placeholder-zinc-500 pl-10 pr-9 py-2.5 rounded-xl border border-zinc-800 focus:outline-none focus:border-cyan-500/60 transition-colors"
           />
-          {filters.search && (
+          {localSearch && (
             <button
-              onClick={() => onChange({ ...filters, search: '' })}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-white"
+              id="clear-search-btn"
+              onClick={() => {
+                setLocalSearch('');
+                onChange({ ...filters, search: '' });
+              }}
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-white p-1"
+              title="Effacer la recherche"
             >
               <X className="w-4 h-4" />
             </button>

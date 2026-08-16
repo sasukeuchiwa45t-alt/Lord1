@@ -22,7 +22,7 @@ interface ProjectCardProps {
   index?: number;
 }
 
-export const ProjectCard: React.FC<ProjectCardProps> = ({
+const ProjectCardComponent: React.FC<ProjectCardProps> = ({
   project,
   onSelect,
   onQuickDownload,
@@ -168,3 +168,5 @@ export const ProjectCard: React.FC<ProjectCardProps> = ({
     </motion.div>
   );
 };
+
+export const ProjectCard = React.memo(ProjectCardComponent);
