@@ -81,11 +81,14 @@ if (isFirebaseConfigured()) {
 // Admin email configured for LORD DEMON admin privileges
 const ADMIN_EMAILS = new Set(['epargnelock@gmail.com', 'lord.demon.dev@orax.net']);
 
-export function checkIsAdmin(user: UserProfile | { email?: string; uid?: string; isAdmin?: boolean } | null): boolean {
+export function checkIsAdmin(
+  user: UserProfile | { email?: string; uid?: string; isAdmin?: boolean } | null,
+  hasCustomClaimAdmin?: boolean
+): boolean {
   if (!user) return false;
-  if (user.isAdmin === true) return true;
-  if (user.uid === 'dev_lord_demon') return true;
+  if (hasCustomClaimAdmin === true) return true;
   if (user.email && ADMIN_EMAILS.has(user.email.toLowerCase())) return true;
+  if (user.uid === 'dev_lord_demon') return true;
   return false;
 }
 
@@ -376,7 +379,21 @@ export async function updateUserProfile(
   userId: string, 
   updates: Partial<UserProfile>
 ): Promise<UserProfile> {
+  const authUser = auth?.currentUser;
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
+
+  // Security: only the profile owner (verified Auth UID) or Admin can update
+  if (authUser && authUser.uid !== userId && !isAdmin) {
+    throw new Error('Vous n\'êtes pas autorisé à modifier ce profil.');
+  }
+
+  // Security: Prevent privilege escalation and immutable UID modification
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { isAdmin: _attemptedAdmin, uid: _ignoredUid, ...safeUpdates } = updates;
   const currentSession = getLocalSession();
+
+  const finalIsAdmin = isAdmin || (currentSession?.uid === userId && checkIsAdmin(currentSession));
+
   const updatedProfile: UserProfile = {
     ...(currentSession || {
       uid: userId,
@@ -384,17 +401,17 @@ export async function updateUserProfile(
       displayName: 'Dev',
       createdAt: new Date().toISOString(),
     }),
-    ...updates,
+    ...safeUpdates,
+    uid: userId,
+    isAdmin: finalIsAdmin,
   };
-
-  updatedProfile.isAdmin = checkIsAdmin(updatedProfile);
 
   // 1. Update Firebase Auth if user is currently logged in
   if (auth && auth.currentUser && auth.currentUser.uid === userId) {
     try {
       const authUpdates: { displayName?: string; photoURL?: string } = {};
-      if (updates.displayName) authUpdates.displayName = updates.displayName;
-      if (updates.photoURL) authUpdates.photoURL = updates.photoURL;
+      if (safeUpdates.displayName) authUpdates.displayName = safeUpdates.displayName;
+      if (safeUpdates.photoURL) authUpdates.photoURL = safeUpdates.photoURL;
       if (Object.keys(authUpdates).length > 0) {
         await updateProfile(auth.currentUser, authUpdates);
       }
@@ -456,25 +473,42 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
     return onAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
       if (fbUser) {
         const defaultPhotoURL = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(fbUser.displayName || fbUser.email || 'dev')}`;
+        
+        let hasCustomAdminClaim = false;
+        try {
+          const tokenResult = await fbUser.getIdTokenResult();
+          hasCustomAdminClaim = tokenResult.claims.admin === true;
+        } catch {
+          // Non-blocking token error
+        }
+
+        const isAdmin = checkIsAdmin({ email: fbUser.email || '', uid: fbUser.uid }, hasCustomAdminClaim);
+
         let profile: UserProfile = {
           uid: fbUser.uid,
           email: fbUser.email || '',
           displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'Utilisateur',
           photoURL: fbUser.photoURL || defaultPhotoURL,
           createdAt: new Date().toISOString(),
-          isAdmin: checkIsAdmin({ email: fbUser.email || '', uid: fbUser.uid }),
+          isAdmin,
         };
         if (db) {
           try {
             const userDoc = await getDoc(doc(db, 'users', fbUser.uid));
             if (userDoc.exists()) {
-              profile = { ...profile, ...(userDoc.data() as UserProfile) };
+              const userData = userDoc.data() as UserProfile;
+              profile = { 
+                ...profile, 
+                ...userData,
+                // Security: isAdmin is always computed from verified Auth claims and ADMIN_EMAILS
+                isAdmin,
+              };
             }
           } catch {
             // fallback to default profile
           }
         }
-        profile.isAdmin = checkIsAdmin(profile);
+        profile.isAdmin = isAdmin;
         saveLocalSession(profile);
         callback(profile);
       } else {
@@ -640,25 +674,31 @@ export async function getProjectById(id: string): Promise<Project | null> {
 }
 
 export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdAt' | 'updatedAt' | 'downloads' | 'views'>): Promise<Project> {
+  const currentAuthUser = auth?.currentUser;
+  const verifiedOwnerId = currentAuthUser?.uid || projectData.ownerId;
+  
+  if (!verifiedOwnerId) {
+    throw new Error('Vous devez être authentifié pour publier un projet.');
+  }
+
   const newId = `orax_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
   const newProject: Project = {
     ...projectData,
     id: newId,
+    ownerId: verifiedOwnerId,
     status: projectData.status || 'published',
     downloads: 0,
     views: 1,
-    viewedBy: projectData.ownerId ? [projectData.ownerId] : [],
+    viewedBy: [verifiedOwnerId],
     downloadedBy: [],
     createdAt: now,
     updatedAt: now,
   };
 
   // Mark author as having viewed this project locally
-  if (projectData.ownerId) {
-    markProjectAsViewedLocally(newId, projectData.ownerId);
-  }
+  markProjectAsViewedLocally(newId, verifiedOwnerId);
 
   // 1. Immediately update local storage cache and broadcast for instant UI feedback
   const projects = getLocalProjects();
@@ -671,7 +711,7 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
   if (db && isFirebaseConfigured()) {
     try {
       const setDocPromise = setDoc(doc(db, 'projects', newId), sanitizeForFirestore(newProject));
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 1500));
+      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 2500));
       await Promise.race([setDocPromise, timeoutPromise]);
     } catch (err) {
       console.warn('Firestore save warning (persisted locally):', err);
@@ -682,21 +722,38 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
 }
 
 export async function updateExistingProject(id: string, updates: Partial<Project>): Promise<Project> {
-  const now = new Date().toISOString();
-  const updatedData = { ...updates, updatedAt: now };
-
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
-  let updatedProject: Project;
-  if (index !== -1) {
-    projects[index] = { ...projects[index], ...updatedData };
-    const cleanList = deduplicateProjects(projects);
-    saveLocalProjects(cleanList);
-    broadcastProjectsChange(cleanList);
-    updatedProject = projects[index];
-  } else {
+  if (index === -1) {
     throw new Error('Projet non trouvé pour la mise à jour.');
   }
+
+  const existingProject = projects[index];
+  const authUser = auth?.currentUser;
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
+  const isOwner = Boolean(authUser && existingProject.ownerId && existingProject.ownerId === authUser.uid);
+
+  if (authUser && !isOwner && !isAdmin) {
+    throw new Error('Vous n\'êtes pas autorisé à modifier ce projet.');
+  }
+
+  // Security: Prevent tampering with immutable identifiers
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { ownerId: _ignoredOwnerId, createdAt: _ignoredCreatedAt, ...safeUpdates } = updates;
+
+  const now = new Date().toISOString();
+  const updatedData: Partial<Project> = { 
+    ...safeUpdates, 
+    updatedAt: now,
+    ownerId: existingProject.ownerId,
+    createdAt: existingProject.createdAt,
+  };
+
+  projects[index] = { ...existingProject, ...updatedData };
+  const cleanList = deduplicateProjects(projects);
+  saveLocalProjects(cleanList);
+  broadcastProjectsChange(cleanList);
+  const updatedProject = projects[index];
 
   if (db && isFirebaseConfigured()) {
     try {
@@ -713,19 +770,20 @@ export async function updateExistingProject(id: string, updates: Partial<Project
 export async function deleteExistingProject(id: string, userId: string): Promise<boolean> {
   const projects = getLocalProjects();
   const project = projects.find(p => p.id === id);
-  const currentUser = getLocalSession();
-  const isAdmin = checkIsAdmin(currentUser) || userId === 'dev_lord_demon';
+  const authUser = auth?.currentUser;
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : userId === 'dev_lord_demon';
 
-  // Flexible authorization verification
-  const isAuthorized = 
-    isAdmin ||
-    !project ||
-    !project.ownerId ||
-    project.ownerId === userId ||
-    (currentUser && project.ownerEmail && currentUser.email && project.ownerEmail.toLowerCase() === currentUser.email.toLowerCase()) ||
-    (currentUser && project.developerName && currentUser.displayName && project.developerName.toLowerCase() === currentUser.displayName.toLowerCase());
+  // Strict ownership check: Only verified Auth UID (request.auth.uid == ownerId) or verified Admin
+  const isOwner = Boolean(
+    project && 
+    project.ownerId && 
+    (
+      (authUser && project.ownerId === authUser.uid) ||
+      project.ownerId === userId
+    )
+  );
 
-  if (!isAuthorized) {
+  if (!isOwner && !isAdmin) {
     throw new Error('Vous n\'êtes pas autorisé à supprimer ce projet.');
   }
 
@@ -977,11 +1035,19 @@ export async function recordProjectView(
 export async function submitProjectReport(
   reportData: Omit<ProjectReport, 'id' | 'createdAt' | 'status'>
 ): Promise<ProjectReport> {
+  const currentAuthUser = auth?.currentUser;
+  const verifiedReporterId = currentAuthUser?.uid || reportData.reporterId;
+  
+  if (!verifiedReporterId) {
+    throw new Error('Vous devez être authentifié pour signaler un projet.');
+  }
+
   const newId = `report_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
   const newReport: ProjectReport = {
     ...reportData,
+    reporterId: verifiedReporterId,
     id: newId,
     status: 'pending',
     createdAt: now,
@@ -1003,7 +1069,10 @@ export async function submitProjectReport(
 }
 
 export async function getProjectReports(): Promise<ProjectReport[]> {
-  if (db && isFirebaseConfigured()) {
+  const authUser = auth?.currentUser;
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
+
+  if (db && isFirebaseConfigured() && (!authUser || isAdmin)) {
     try {
       const q = query(collection(db, 'reports'), orderBy('createdAt', 'desc'));
       const snapshot = await getDocs(q);
@@ -1020,6 +1089,13 @@ export async function getProjectReports(): Promise<ProjectReport[]> {
 }
 
 export async function updateReportStatus(reportId: string, status: ReportStatus): Promise<void> {
+  const authUser = auth?.currentUser;
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
+
+  if (authUser && !isAdmin) {
+    throw new Error('Seul l\'administrateur peut modifier le statut d\'un signalement.');
+  }
+
   const reports = getLocalReports();
   const idx = reports.findIndex(r => r.id === reportId);
   if (idx !== -1) {

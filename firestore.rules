@@ -2,7 +2,9 @@ rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
     
-    // Helper functions
+    // --------------------------------------------------------------------------
+    // HELPER SECURITY FUNCTIONS
+    // --------------------------------------------------------------------------
     function isAuthenticated() {
       return request.auth != null;
     }
@@ -11,53 +13,99 @@ service cloud.firestore {
       return isAuthenticated() && request.auth.uid == userId;
     }
     
+    // Firebase Custom Claim or Verified Super-Admin
     function isLordDemonAdmin() {
       return isAuthenticated() && (
-        request.auth.token.email == 'epargnelock@gmail.com' || 
         request.auth.token.admin == true || 
-        request.auth.uid == 'dev_lord_demon'
+        request.auth.token.email == 'epargnelock@gmail.com'
       );
     }
 
-    // Projects collection
+    // --------------------------------------------------------------------------
+    // PROJECTS COLLECTION
+    // --------------------------------------------------------------------------
     match /projects/{projectId} {
-      // Anyone can read public projects
-      allow read: if true;
+      // Unauthenticated or general users can read public/published projects;
+      // Owners and Admins can also read unpublished/moderated projects
+      allow read: if resource == null 
+                  || resource.data.status == 'published' 
+                  || !('status' in resource.data)
+                  || isOwner(resource.data.ownerId) 
+                  || isLordDemonAdmin();
       
-      // Only authenticated users can create new projects under their own ID
+      // Only authenticated users can create projects under their own verified Firebase Auth UID
       allow create: if isAuthenticated() 
                     && request.resource.data.ownerId == request.auth.uid
                     && request.resource.data.name is string
-                    && request.resource.data.name.size() > 0;
+                    && request.resource.data.name.size() > 0
+                    && request.resource.data.name.size() <= 120
+                    && request.resource.data.createdAt is string
+                    && (!('downloads' in request.resource.data) || request.resource.data.downloads == 0)
+                    && (!('views' in request.resource.data) || request.resource.data.views == 0 || request.resource.data.views == 1);
                     
-      // Project owner or admin can update full project; or atomic counter increments & unique viewers/downloaders
-      allow update: if isOwner(resource.data.ownerId) 
+      // Project updates:
+      // 1. Owner can update project details (ownerId and createdAt remain immutable)
+      // 2. Admin can perform any update (status, featured, moderation)
+      // 3. Counter increments can only touch stats fields
+      allow update: if (
+                        isOwner(resource.data.ownerId)
+                        && request.resource.data.ownerId == resource.data.ownerId
+                        && request.resource.data.createdAt == resource.data.createdAt
+                       )
                     || isLordDemonAdmin()
                     || (
-                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views', 'downloadedBy', 'viewedBy'])
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views', 'downloadedBy', 'viewedBy', 'updatedAt'])
                        );
-                       
-      // Only project owner or admin can delete project
+                        
+      // Strictly only the project owner (verified UID) or Admin can delete the project
+      // Email or display names are strictly NOT accepted as proof of ownership
       allow delete: if isOwner(resource.data.ownerId) 
-                    || isLordDemonAdmin() 
-                    || (isAuthenticated() && request.auth.token.email == resource.data.ownerEmail);
+                    || isLordDemonAdmin();
     }
     
-    // Moderation & Reports collection
+    // --------------------------------------------------------------------------
+    // MODERATION & REPORTS COLLECTION
+    // --------------------------------------------------------------------------
     match /reports/{reportId} {
-      // Authenticated users can submit a report
-      allow create: if isAuthenticated();
+      // Authenticated users can submit a report under their own UID with 'pending' status
+      allow create: if isAuthenticated()
+                    && request.resource.data.reporterId == request.auth.uid
+                    && request.resource.data.projectId is string
+                    && request.resource.data.status == 'pending'
+                    && request.resource.data.createdAt is string;
       
-      // Only administrators can read, review, or delete reports
+      // Standard users CANNOT view other reports, modify status, or delete reports
+      // Only administrators can read, review, status-change, or delete reports
       allow read, update, delete: if isLordDemonAdmin();
     }
     
-    // Users collection
+    // --------------------------------------------------------------------------
+    // USERS COLLECTION
+    // --------------------------------------------------------------------------
     match /users/{userId} {
+      // Profiles are publicly readable for author credits and community view
       allow read: if true;
-      allow create, update: if isOwner(userId) || isLordDemonAdmin();
-      allow delete: if isLordDemonAdmin();
+      
+      // Users can create their own profile under their Auth UID, cannot self-grant admin
+      allow create: if isOwner(userId)
+                    && (!('isAdmin' in request.resource.data) || request.resource.data.isAdmin == false || isLordDemonAdmin());
+      
+      // Users can update their profile but cannot alter UID or self-escalate admin rights
+      allow update: if (
+                        isOwner(userId) 
+                        && request.resource.data.uid == userId
+                        && (
+                          !('isAdmin' in request.resource.data) 
+                          || request.resource.data.isAdmin == resource.data.isAdmin 
+                          || isLordDemonAdmin()
+                        )
+                       )
+                    || isLordDemonAdmin();
+                    
+      // Only Admin or the account owner can delete user profile
+      allow delete: if isLordDemonAdmin() || isOwner(userId);
     }
   }
 }
+
 
