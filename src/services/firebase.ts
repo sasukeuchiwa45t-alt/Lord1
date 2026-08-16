@@ -29,8 +29,7 @@ import {
   onSnapshot,
   Firestore
 } from 'firebase/firestore';
-import { Project, UserProfile } from '../types';
-import { INITIAL_DEMO_PROJECTS } from '../data/demoProjects';
+import { Project, UserProfile, ProjectReport, ProjectStatus, ReportStatus } from '../types';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || '',
@@ -43,6 +42,14 @@ const firebaseConfig = {
 
 export function isFirebaseConfigured(): boolean {
   return Boolean(firebaseConfig.apiKey && firebaseConfig.projectId);
+}
+
+export function formatFileSize(bytes: number): string {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
 }
 
 let app: FirebaseApp | null = null;
@@ -69,6 +76,17 @@ if (isFirebaseConfigured()) {
   }
 }
 
+// Admin email configured for LORD DEMON admin privileges
+const ADMIN_EMAILS = new Set(['epargnelock@gmail.com', 'lord.demon.dev@orax.net']);
+
+export function checkIsAdmin(user: UserProfile | { email?: string; uid?: string; isAdmin?: boolean } | null): boolean {
+  if (!user) return false;
+  if (user.isAdmin === true) return true;
+  if (user.uid === 'dev_lord_demon') return true;
+  if (user.email && ADMIN_EMAILS.has(user.email.toLowerCase())) return true;
+  return false;
+}
+
 // Helper to remove any undefined properties before sending to Firestore
 function sanitizeForFirestore<T extends Record<string, any>>(obj: T): T {
   const clean: Record<string, any> = {};
@@ -85,10 +103,11 @@ function sanitizeForFirestore<T extends Record<string, any>>(obj: T): T {
 }
 
 // --------------------------------------------------------------------------
-// LOCAL PERSISTENCE ENGINE (Fallback for preview & offline mode)
+// LOCAL PERSISTENCE ENGINE & DE-DUPLICATION
 // --------------------------------------------------------------------------
 const STORAGE_KEY_PROJECTS = 'orax_projet_items_v2';
 const STORAGE_KEY_USERS = 'orax_projet_users_v2';
+const STORAGE_KEY_REPORTS = 'orax_projet_reports_v2';
 const STORAGE_KEY_SESSION = 'orax_projet_current_user_v2';
 
 const DEMO_PROJECT_IDS = new Set([
@@ -102,17 +121,28 @@ const DEMO_PROJECT_IDS = new Set([
   'electron-markdown-studio'
 ]);
 
+export function deduplicateProjects(projects: Project[]): Project[] {
+  const seen = new Set<string>();
+  const unique: Project[] = [];
+  for (const p of projects) {
+    if (p && p.id && !DEMO_PROJECT_IDS.has(p.id) && !seen.has(p.id)) {
+      seen.add(p.id);
+      unique.push(p);
+    }
+  }
+  return unique;
+}
+
 function getLocalProjects(): Project[] {
   try {
     const saved = localStorage.getItem(STORAGE_KEY_PROJECTS);
     if (saved) {
       const parsed: Project[] = JSON.parse(saved);
-      // Clean and keep only projects published by real users
-      const realOnly = parsed.filter(p => p && p.id && !DEMO_PROJECT_IDS.has(p.id));
-      if (realOnly.length !== parsed.length) {
-        localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(realOnly));
+      const unique = deduplicateProjects(parsed);
+      if (unique.length !== parsed.length) {
+        localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(unique));
       }
-      return realOnly;
+      return unique;
     }
   } catch {
     // Ignore storage parse error
@@ -121,8 +151,8 @@ function getLocalProjects(): Project[] {
 }
 
 function saveLocalProjects(projects: Project[]): void {
-  const realOnly = projects.filter(p => p && p.id && !DEMO_PROJECT_IDS.has(p.id));
-  localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(realOnly));
+  const unique = deduplicateProjects(projects);
+  localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(unique));
 }
 
 function getLocalUsers(): UserProfile[] {
@@ -137,11 +167,29 @@ function getLocalUsers(): UserProfile[] {
   return [];
 }
 
+function getLocalReports(): ProjectReport[] {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY_REPORTS);
+    if (saved) {
+      return JSON.parse(saved);
+    }
+  } catch {
+    // Ignore
+  }
+  return [];
+}
+
+function saveLocalReports(reports: ProjectReport[]): void {
+  localStorage.setItem(STORAGE_KEY_REPORTS, JSON.stringify(reports));
+}
+
 function getLocalSession(): UserProfile | null {
   try {
     const saved = localStorage.getItem(STORAGE_KEY_SESSION);
     if (saved) {
-      return JSON.parse(saved);
+      const parsed = JSON.parse(saved);
+      parsed.isAdmin = checkIsAdmin(parsed);
+      return parsed;
     }
   } catch {
     // Ignore
@@ -151,6 +199,7 @@ function getLocalSession(): UserProfile | null {
 
 function saveLocalSession(user: UserProfile | null): void {
   if (user) {
+    user.isAdmin = checkIsAdmin(user);
     localStorage.setItem(STORAGE_KEY_SESSION, JSON.stringify(user));
   } else {
     localStorage.removeItem(STORAGE_KEY_SESSION);
@@ -194,6 +243,7 @@ export async function registerUser(
 ): Promise<UserProfile> {
   const finalPhotoURL = customPhotoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(displayName || email)}`;
   const cleanDisplayName = displayName.trim() || email.split('@')[0];
+  const isAdmin = ADMIN_EMAILS.has(email.toLowerCase());
 
   if (auth && isFirebaseConfigured()) {
     try {
@@ -216,6 +266,7 @@ export async function registerUser(
         createdAt: new Date().toISOString(),
         projectsCount: 0,
         totalDownloads: 0,
+        isAdmin,
       };
 
       if (db) {
@@ -246,6 +297,7 @@ export async function registerUser(
     createdAt: new Date().toISOString(),
     projectsCount: 0,
     totalDownloads: 0,
+    isAdmin,
   };
 
   users.push(newUser);
@@ -256,6 +308,7 @@ export async function registerUser(
 
 export async function loginUser(email: string, password: string): Promise<UserProfile> {
   const defaultPhotoURL = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(email)}`;
+  const isAdmin = ADMIN_EMAILS.has(email.toLowerCase());
 
   if (auth && isFirebaseConfigured()) {
     try {
@@ -268,6 +321,7 @@ export async function loginUser(email: string, password: string): Promise<UserPr
         createdAt: new Date().toISOString(),
         projectsCount: 0,
         totalDownloads: 0,
+        isAdmin,
       };
 
       if (db) {
@@ -276,7 +330,6 @@ export async function loginUser(email: string, password: string): Promise<UserPr
           if (userDoc.exists()) {
             userProfile = { ...userProfile, ...(userDoc.data() as UserProfile) };
           } else {
-            // Asynchronously sync profile to firestore
             setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
               .catch((err) => console.warn('Firestore user init warning:', err));
           }
@@ -285,6 +338,7 @@ export async function loginUser(email: string, password: string): Promise<UserPr
         }
       }
       
+      userProfile.isAdmin = checkIsAdmin(userProfile);
       saveLocalSession(userProfile);
       return userProfile;
     } catch (err: any) {
@@ -297,7 +351,6 @@ export async function loginUser(email: string, password: string): Promise<UserPr
   let found = users.find(u => u.email.toLowerCase() === email.toLowerCase());
   
   if (!found) {
-    // If not found in mock list, auto-create to allow seamless testing
     found = {
       uid: `user_${Date.now()}`,
       email,
@@ -306,11 +359,13 @@ export async function loginUser(email: string, password: string): Promise<UserPr
       createdAt: new Date().toISOString(),
       projectsCount: 0,
       totalDownloads: 0,
+      isAdmin,
     };
     users.push(found);
     localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(users));
   }
 
+  found.isAdmin = checkIsAdmin(found);
   saveLocalSession(found);
   return found;
 }
@@ -329,6 +384,8 @@ export async function updateUserProfile(
     }),
     ...updates,
   };
+
+  updatedProfile.isAdmin = checkIsAdmin(updatedProfile);
 
   // 1. Update Firebase Auth if user is currently logged in
   if (auth && auth.currentUser && auth.currentUser.uid === userId) {
@@ -403,6 +460,7 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
           displayName: fbUser.displayName || fbUser.email?.split('@')[0] || 'Utilisateur',
           photoURL: fbUser.photoURL || defaultPhotoURL,
           createdAt: new Date().toISOString(),
+          isAdmin: checkIsAdmin({ email: fbUser.email || '', uid: fbUser.uid }),
         };
         if (db) {
           try {
@@ -414,8 +472,11 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
             // fallback to default profile
           }
         }
+        profile.isAdmin = checkIsAdmin(profile);
+        saveLocalSession(profile);
         callback(profile);
       } else {
+        saveLocalSession(null);
         callback(null);
       }
     });
@@ -433,6 +494,28 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
 }
 
 // --------------------------------------------------------------------------
+// POPULARITY ALGORITHM
+// --------------------------------------------------------------------------
+
+/**
+ * Calculates a balanced popularity score based on downloads (x3), views (x1),
+ * and recency decay so new active projects can trend without being permanently locked behind historical numbers.
+ */
+export function calculatePopularityScore(project: Project): number {
+  const downloads = project.downloads || 0;
+  const views = project.views || 0;
+  const createdTime = new Date(project.createdAt || Date.now()).getTime();
+  const daysSinceCreation = Math.max(0, (Date.now() - createdTime) / (1000 * 60 * 60 * 24));
+  
+  // Recency decay factor (newer projects have multiplier up to 1.0, older projects decay gradually to 0.3)
+  const recencyFactor = Math.max(0.3, 1 / (1 + daysSinceCreation * 0.03));
+  const baseScore = (downloads * 3 + views * 1) * recencyFactor;
+  const featuredBonus = project.featured ? 25 : 0;
+  
+  return Math.round(baseScore + featuredBonus);
+}
+
+// --------------------------------------------------------------------------
 // FIRESTORE & PROJECT SERVICES
 // --------------------------------------------------------------------------
 
@@ -440,7 +523,8 @@ const PROJECTS_CHANGE_EVENT = 'orax_projects_changed';
 
 export function broadcastProjectsChange(projects: Project[]): void {
   if (typeof window !== 'undefined') {
-    window.dispatchEvent(new CustomEvent(PROJECTS_CHANGE_EVENT, { detail: projects }));
+    const unique = deduplicateProjects(projects);
+    window.dispatchEvent(new CustomEvent(PROJECTS_CHANGE_EVENT, { detail: unique }));
   }
 }
 
@@ -464,7 +548,7 @@ export function subscribeToProjects(callback: (projects: Project[]) => void): ()
         (snapshot) => {
           if (snapshot && !snapshot.empty) {
             const fetched = snapshot.docs.map((d) => ({ id: d.id, ...d.data() } as Project));
-            const realOnly = fetched.filter((p) => p && p.id && !DEMO_PROJECT_IDS.has(p.id));
+            const realOnly = deduplicateProjects(fetched);
             saveLocalProjects(realOnly);
             callback(realOnly);
           } else if (snapshot && snapshot.empty) {
@@ -484,7 +568,7 @@ export function subscribeToProjects(callback: (projects: Project[]) => void): ()
   const handleCustomChange = (e: Event) => {
     const customEvent = e as CustomEvent<Project[]>;
     if (customEvent.detail) {
-      callback(customEvent.detail);
+      callback(deduplicateProjects(customEvent.detail));
     } else {
       callback(getLocalProjects());
     }
@@ -520,7 +604,7 @@ export async function getProjects(): Promise<Project[]> {
       const snapshot = await Promise.race([fetchPromise, timeoutPromise]);
       if (snapshot && !snapshot.empty) {
         const fetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Project));
-        const realOnly = fetched.filter(p => p && p.id && !DEMO_PROJECT_IDS.has(p.id));
+        const realOnly = deduplicateProjects(fetched);
         saveLocalProjects(realOnly);
         return realOnly;
       }
@@ -560,6 +644,7 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
   const newProject: Project = {
     ...projectData,
     id: newId,
+    status: projectData.status || 'published',
     downloads: 0,
     views: 1,
     createdAt: now,
@@ -568,9 +653,10 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
 
   // 1. Immediately update local storage cache and broadcast for instant UI feedback
   const projects = getLocalProjects();
-  projects.unshift(newProject);
-  saveLocalProjects(projects);
-  broadcastProjectsChange(projects);
+  // Filter out any existing with same ID and prepend
+  const updatedList = deduplicateProjects([newProject, ...projects]);
+  saveLocalProjects(updatedList);
+  broadcastProjectsChange(updatedList);
 
   // 2. Synchronize to Firestore with timeout race
   if (db && isFirebaseConfigured()) {
@@ -595,8 +681,9 @@ export async function updateExistingProject(id: string, updates: Partial<Project
   let updatedProject: Project;
   if (index !== -1) {
     projects[index] = { ...projects[index], ...updatedData };
-    saveLocalProjects(projects);
-    broadcastProjectsChange(projects);
+    const cleanList = deduplicateProjects(projects);
+    saveLocalProjects(cleanList);
+    broadcastProjectsChange(cleanList);
     updatedProject = projects[index];
   } else {
     throw new Error('Projet non trouvé pour la mise à jour.');
@@ -617,12 +704,14 @@ export async function updateExistingProject(id: string, updates: Partial<Project
 export async function deleteExistingProject(id: string, userId: string): Promise<boolean> {
   const projects = getLocalProjects();
   const project = projects.find(p => p.id === id);
+  const currentUser = getLocalSession();
+  const isAdmin = checkIsAdmin(currentUser) || userId === 'dev_lord_demon';
 
-  if (project && project.ownerId !== userId && userId !== 'dev_lord_demon') {
+  if (project && project.ownerId !== userId && !isAdmin) {
     throw new Error('Vous n\'êtes pas autorisé à supprimer ce projet.');
   }
 
-  const updated = projects.filter(p => p.id !== id);
+  const updated = deduplicateProjects(projects.filter(p => p.id !== id));
   saveLocalProjects(updated);
   broadcastProjectsChange(updated);
 
@@ -637,7 +726,21 @@ export async function deleteExistingProject(id: string, userId: string): Promise
   return true;
 }
 
+// Anti-spam cooldown sets in memory and storage
+const downloadedCooldowns = new Set<string>();
+const viewedCooldowns = new Set<string>();
+
 export async function recordProjectDownload(id: string): Promise<number> {
+  const key = `dl_${id}`;
+  const now = Date.now();
+  // Anti-double-click guard: 3 seconds throttle
+  if (downloadedCooldowns.has(key)) {
+    const current = getLocalProjects().find(p => p.id === id);
+    return current?.downloads || 1;
+  }
+  downloadedCooldowns.add(key);
+  setTimeout(() => downloadedCooldowns.delete(key), 3000);
+
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
   let updatedDownloads = 1;
@@ -645,8 +748,9 @@ export async function recordProjectDownload(id: string): Promise<number> {
   if (index !== -1) {
     projects[index].downloads = (projects[index].downloads || 0) + 1;
     updatedDownloads = projects[index].downloads;
-    saveLocalProjects(projects);
-    broadcastProjectsChange(projects);
+    const clean = deduplicateProjects(projects);
+    saveLocalProjects(clean);
+    broadcastProjectsChange(clean);
   }
 
   if (db && isFirebaseConfigured()) {
@@ -662,6 +766,14 @@ export async function recordProjectDownload(id: string): Promise<number> {
 }
 
 export async function recordProjectView(id: string): Promise<number> {
+  const key = `view_${id}`;
+  if (viewedCooldowns.has(key)) {
+    const current = getLocalProjects().find(p => p.id === id);
+    return current?.views || 1;
+  }
+  viewedCooldowns.add(key);
+  setTimeout(() => viewedCooldowns.delete(key), 5000);
+
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
   let updatedViews = 1;
@@ -669,8 +781,9 @@ export async function recordProjectView(id: string): Promise<number> {
   if (index !== -1) {
     projects[index].views = (projects[index].views || 0) + 1;
     updatedViews = projects[index].views;
-    saveLocalProjects(projects);
-    broadcastProjectsChange(projects);
+    const clean = deduplicateProjects(projects);
+    saveLocalProjects(clean);
+    broadcastProjectsChange(clean);
   }
 
   if (db && isFirebaseConfigured()) {
@@ -683,4 +796,76 @@ export async function recordProjectView(id: string): Promise<number> {
   }
 
   return updatedViews;
+}
+
+// --------------------------------------------------------------------------
+// MODERATION & REPORTS SERVICES
+// --------------------------------------------------------------------------
+
+export async function submitProjectReport(
+  reportData: Omit<ProjectReport, 'id' | 'createdAt' | 'status'>
+): Promise<ProjectReport> {
+  const newId = `report_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+  const now = new Date().toISOString();
+
+  const newReport: ProjectReport = {
+    ...reportData,
+    id: newId,
+    status: 'pending',
+    createdAt: now,
+  };
+
+  const reports = getLocalReports();
+  reports.unshift(newReport);
+  saveLocalReports(reports);
+
+  if (db && isFirebaseConfigured()) {
+    try {
+      await setDoc(doc(db, 'reports', newId), sanitizeForFirestore(newReport));
+    } catch (err) {
+      console.warn('Firestore save report warning:', err);
+    }
+  }
+
+  return newReport;
+}
+
+export async function getProjectReports(): Promise<ProjectReport[]> {
+  if (db && isFirebaseConfigured()) {
+    try {
+      const q = query(collection(db, 'reports'), orderBy('createdAt', 'desc'));
+      const snapshot = await getDocs(q);
+      if (snapshot && !snapshot.empty) {
+        const fetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as ProjectReport));
+        saveLocalReports(fetched);
+        return fetched;
+      }
+    } catch (err) {
+      console.warn('Firestore reports fetch fallback:', err);
+    }
+  }
+  return getLocalReports();
+}
+
+export async function updateReportStatus(reportId: string, status: ReportStatus): Promise<void> {
+  const reports = getLocalReports();
+  const idx = reports.findIndex(r => r.id === reportId);
+  if (idx !== -1) {
+    reports[idx].status = status;
+    reports[idx].updatedAt = new Date().toISOString();
+    saveLocalReports(reports);
+  }
+
+  if (db && isFirebaseConfigured()) {
+    try {
+      const docRef = doc(db, 'reports', reportId);
+      await updateDoc(docRef, { status, updatedAt: new Date().toISOString() });
+    } catch (err) {
+      console.warn('Firestore report status update error:', err);
+    }
+  }
+}
+
+export async function updateProjectStatus(projectId: string, status: ProjectStatus): Promise<void> {
+  await updateExistingProject(projectId, { status });
 }

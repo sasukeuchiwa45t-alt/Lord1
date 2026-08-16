@@ -18,6 +18,8 @@ import { UserProfile } from './components/UserProfile';
 import { EditProjectModal } from './components/EditProjectModal';
 import { DeleteConfirmModal } from './components/DeleteConfirmModal';
 import { CategoriesView } from './components/CategoriesView';
+import { AdminPanel } from './components/AdminPanel';
+import { ReportModal } from './components/ReportModal';
 import { ToastProvider, useToast } from './components/Toast';
 import { 
   getProjects, 
@@ -44,7 +46,7 @@ function MainApp() {
   const { showToast } = useToast();
 
   // Navigation State
-  const [currentTab, setCurrentTab] = useState<'home' | 'projects' | 'categories' | 'popular' | 'profile'>('home');
+  const [currentTab, setCurrentTab] = useState<'home' | 'projects' | 'categories' | 'popular' | 'profile' | 'admin'>('home');
   
   // Data State
   const [projects, setProjects] = useState<Project[]>([]);
@@ -64,6 +66,7 @@ function MainApp() {
   const [selectedProject, setSelectedProject] = useState<Project | null>(null);
   const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [deletingProject, setDeletingProject] = useState<Project | null>(null);
+  const [reportingProject, setReportingProject] = useState<Project | null>(null);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authInitialMode, setAuthInitialMode] = useState<'login' | 'register'>('login');
   const [publishModalOpen, setPublishModalOpen] = useState(false);
@@ -96,16 +99,31 @@ function MainApp() {
         (liveCurrent.views !== selectedProject.views ||
           liveCurrent.downloads !== selectedProject.downloads ||
           liveCurrent.updatedAt !== selectedProject.updatedAt ||
-          liveCurrent.name !== selectedProject.name)
+          liveCurrent.name !== selectedProject.name ||
+          liveCurrent.status !== selectedProject.status)
       ) {
         setSelectedProject(liveCurrent);
       }
     }
   }, [projects, selectedProject]);
 
+  // Is current user admin
+  const isAdmin = currentUser?.isAdmin || currentUser?.email?.toLowerCase() === 'epargnelock@gmail.com';
+
+  // Visible projects for normal users (filters out hidden projects unless owner or admin)
+  const visibleProjects = useMemo(() => {
+    return projects.filter(p => {
+      if (isAdmin) return true;
+      if (p.status === 'hidden') {
+        return currentUser && (currentUser.uid === p.ownerId || currentUser.uid === 'dev_lord_demon');
+      }
+      return true;
+    });
+  }, [projects, isAdmin, currentUser]);
+
   // Filtered & Sorted Projects computation
   const filteredProjects = useMemo(() => {
-    let result = [...projects];
+    let result = [...visibleProjects];
 
     // Search query filter (matches name, developer, description, technologies, tags, category)
     if (filters.search.trim()) {
@@ -148,9 +166,9 @@ function MainApp() {
         case 'downloads':
           return (b.downloads || 0) - (a.downloads || 0);
         case 'popular':
-          // Popularity score = (downloads * 2) + views
-          const scoreA = (a.downloads || 0) * 2 + (a.views || 0);
-          const scoreB = (b.downloads || 0) * 2 + (b.views || 0);
+          // Popularity score = (downloads * 3) + views
+          const scoreA = (a.downloads || 0) * 3 + (a.views || 0);
+          const scoreB = (b.downloads || 0) * 3 + (b.views || 0);
           return scoreB - scoreA;
         case 'oldest':
           return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
@@ -163,30 +181,30 @@ function MainApp() {
     });
 
     return result;
-  }, [projects, filters]);
+  }, [visibleProjects, filters]);
 
   // Derived sections for Homepage & Popular view
   const topDownloadedProjects = useMemo(() => {
-    return [...projects]
+    return [...visibleProjects]
       .sort((a, b) => (b.downloads || 0) - (a.downloads || 0))
       .slice(0, 6);
-  }, [projects]);
+  }, [visibleProjects]);
 
   const mostPopularProjects = useMemo(() => {
-    return [...projects]
+    return [...visibleProjects]
       .sort((a, b) => {
-        const scoreA = (a.downloads || 0) * 2 + (a.views || 0);
-        const scoreB = (b.downloads || 0) * 2 + (b.views || 0);
+        const scoreA = (a.downloads || 0) * 3 + (a.views || 0);
+        const scoreB = (b.downloads || 0) * 3 + (b.views || 0);
         return scoreB - scoreA;
       })
       .slice(0, 6);
-  }, [projects]);
+  }, [visibleProjects]);
 
   const recentProjects = useMemo(() => {
-    return [...projects]
+    return [...visibleProjects]
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
       .slice(0, 6);
-  }, [projects]);
+  }, [visibleProjects]);
 
   const userProjects = useMemo(() => {
     if (!currentUser) return [];
@@ -223,7 +241,7 @@ function MainApp() {
       title: 'Déconnexion réussie',
       type: 'info',
     });
-    if (currentTab === 'profile') {
+    if (currentTab === 'profile' || currentTab === 'admin') {
       setCurrentTab('home');
     }
   };
@@ -534,7 +552,7 @@ function MainApp() {
         {/* VIEW 3: CATEGORIES */}
         {currentTab === 'categories' && (
           <CategoriesView
-            projects={projects}
+            projects={visibleProjects}
             onSelectCategory={(catId) => {
               setFilters((prev) => ({ ...prev, category: catId }));
               setCurrentTab('projects');
@@ -559,7 +577,7 @@ function MainApp() {
               </p>
             </div>
 
-            {projects.length === 0 ? (
+            {visibleProjects.length === 0 ? (
               <div className="p-10 sm:p-12 rounded-3xl bg-zinc-900/60 border border-zinc-800 text-center space-y-4 max-w-xl mx-auto">
                 <div className="w-14 h-14 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-400 flex items-center justify-center mx-auto">
                   <Flame className="w-7 h-7" />
@@ -623,7 +641,7 @@ function MainApp() {
                     <h2 className="text-xl font-bold text-white font-mono">📅 Les Plus Anciens (Archives)</h2>
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                    {[...projects]
+                    {[...visibleProjects]
                       .sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime())
                       .slice(0, 3)
                       .map((project, i) => (
@@ -651,6 +669,24 @@ function MainApp() {
             onDeleteProject={setDeletingProject}
             onOpenPublish={handleOpenPublish}
             onUpdateUser={(updated) => setCurrentUser(updated)}
+          />
+        )}
+
+        {/* VIEW 6: ADMIN PANEL (LORD DEMON) */}
+        {currentTab === 'admin' && (
+          <AdminPanel
+            currentUser={currentUser}
+            projects={projects}
+            onOpenDetail={setSelectedProject}
+            onRefreshData={() => {
+              getProjects().then(setProjects);
+            }}
+            onShowToast={(msg, type) => {
+              showToast({
+                title: msg,
+                type: type || 'info',
+              });
+            }}
           />
         )}
 
@@ -766,7 +802,27 @@ function MainApp() {
               setSelectedProject(null);
               setDeletingProject(p);
             }}
+            onReport={(p) => {
+              setReportingProject(p);
+            }}
             onProjectUpdated={handleProjectUpdated}
+          />
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {reportingProject && (
+          <ReportModal
+            isOpen={!!reportingProject}
+            project={reportingProject}
+            currentUser={currentUser}
+            onClose={() => setReportingProject(null)}
+            onShowToast={(msg, type) => {
+              showToast({
+                title: msg,
+                type: type || 'info',
+              });
+            }}
           />
         )}
       </AnimatePresence>

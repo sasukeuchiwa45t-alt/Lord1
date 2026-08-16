@@ -16,7 +16,8 @@ import {
   ShieldCheck, 
   Layers,
   Edit,
-  Trash2
+  Trash2,
+  Flag
 } from 'lucide-react';
 import { Project, UserProfile } from '../types';
 import { getCategoryById } from '../data/categories';
@@ -25,7 +26,7 @@ import { recordProjectDownload, recordProjectView } from '../services/firebase';
 import { triggerProjectDownload } from '../utils/downloadHelper';
 import { useToast } from './Toast';
 import confetti from 'canvas-confetti';
-import { motion, AnimatePresence } from 'motion/react';
+import { motion } from 'motion/react';
 
 interface ProjectDetailModalProps {
   project: Project | null;
@@ -33,6 +34,7 @@ interface ProjectDetailModalProps {
   currentUser: UserProfile | null;
   onEdit?: (project: Project) => void;
   onDelete?: (project: Project) => void;
+  onReport?: (project: Project) => void;
   onProjectUpdated?: (updated: Project) => void;
 }
 
@@ -42,6 +44,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
   currentUser,
   onEdit,
   onDelete,
+  onReport,
   onProjectUpdated,
 }) => {
   const { showToast } = useToast();
@@ -124,7 +127,7 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
         setDownloading(false);
         showToast({
           title: 'Téléchargement réussi !',
-          message: 'Le fichier du projet a été enregistré sur votre téléphone.',
+          message: 'Le fichier du projet a été enregistré sur votre appareil.',
           type: 'success',
         });
       }, 1000);
@@ -173,6 +176,18 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           </div>
 
           <div className="flex items-center gap-2">
+            {onReport && (
+              <button
+                id="btn-report-project-modal"
+                onClick={() => onReport(project)}
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-zinc-800/80 hover:bg-rose-950/80 text-zinc-400 hover:text-rose-300 border border-zinc-700 hover:border-rose-800/50 text-xs transition-colors"
+                title="Signaler ce projet"
+              >
+                <Flag className="w-3.5 h-3.5 text-rose-400" />
+                <span className="hidden sm:inline">Signaler</span>
+              </button>
+            )}
+
             <button
               id="btn-copy-project-link"
               onClick={handleCopyLink}
@@ -376,3 +391,4 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
     </div>
   );
 };
+

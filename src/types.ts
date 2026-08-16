@@ -9,6 +9,8 @@ export type ProjectCategory =
   | 'script'
   | 'other';
 
+export type ProjectStatus = 'published' | 'pending' | 'hidden' | 'rejected';
+
 export interface Project {
   id: string;
   name: string;
@@ -29,6 +31,7 @@ export interface Project {
   downloads: number;
   views: number;
   featured?: boolean;
+  status?: ProjectStatus;
   demoUrl?: string;
   githubUrl?: string;
   version?: string;
@@ -47,6 +50,7 @@ export interface UserProfile {
   website?: string;
   totalDownloads?: number;
   projectsCount?: number;
+  isAdmin?: boolean;
 }
 
 export type SortOption = 'recent' | 'oldest' | 'downloads' | 'popular' | 'alpha';
@@ -75,4 +79,27 @@ export interface CategoryMetadata {
   color: string;
   badgeBg: string;
   borderColor: string;
+}
+
+export type ReportReason = 
+  | 'malicious' 
+  | 'spam' 
+  | 'stolen' 
+  | 'inappropriate' 
+  | 'dangerous' 
+  | 'other';
+
+export type ReportStatus = 'pending' | 'reviewed' | 'dismissed' | 'actioned';
+
+export interface ProjectReport {
+  id: string;
+  projectId: string;
+  projectName: string;
+  reporterId: string;
+  reporterEmail?: string;
+  reason: ReportReason;
+  details?: string;
+  status: ReportStatus;
+  createdAt: string;
+  updatedAt?: string;
 }

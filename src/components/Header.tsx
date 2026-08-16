@@ -102,7 +102,7 @@ export const Header: React.FC<HeaderProps> = ({
             </div>
           </div>
 
-          {/* Desktop Navigation Links */}
+            {/* Desktop Navigation Links */}
           <nav className="hidden lg:flex items-center gap-1 xl:gap-2">
             <button
               id="nav-home-btn"
@@ -150,6 +150,20 @@ export const Header: React.FC<HeaderProps> = ({
               <Flame className="w-4 h-4 text-amber-400" />
               Populaires
             </button>
+            {currentUser && (currentUser.isAdmin || currentUser.email?.toLowerCase() === 'epargnelock@gmail.com') && (
+              <button
+                id="nav-admin-btn"
+                onClick={() => handleNavClick('admin')}
+                className={`px-3 py-2 rounded-lg text-sm font-medium transition-colors flex items-center gap-1.5 ${
+                  currentTab === 'admin'
+                    ? 'text-cyan-400 bg-cyan-950/60 border border-cyan-500/50 shadow-sm shadow-cyan-500/20'
+                    : 'text-zinc-300 hover:text-white hover:bg-zinc-900'
+                }`}
+              >
+                <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                Admin
+              </button>
+            )}
           </nav>
 
           {/* Action Buttons: Publish + User/Auth */}
@@ -218,6 +232,19 @@ export const Header: React.FC<HeaderProps> = ({
                       <Upload className="w-4 h-4 text-blue-400" />
                       Nouveau Projet
                     </button>
+
+                    {(currentUser.isAdmin || currentUser.email?.toLowerCase() === 'epargnelock@gmail.com') && (
+                      <button
+                        id="dropdown-admin-btn"
+                        onClick={() => {
+                          handleNavClick('admin');
+                        }}
+                        className="w-full flex items-center gap-2.5 px-3 py-2 text-xs font-medium text-cyan-300 hover:text-cyan-200 hover:bg-cyan-950/40 rounded-lg transition-colors"
+                      >
+                        <ShieldCheck className="w-4 h-4 text-cyan-400" />
+                        Console Admin LORD DEMON
+                      </button>
+                    )}
 
                     <div className="border-t border-zinc-800 mt-1 pt-1">
                       <button
