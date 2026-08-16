@@ -1,0 +1,47 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isLordDemonAdmin() {
+      return isAuthenticated() && (request.auth.uid == 'dev_lord_demon' || request.auth.token.email == 'lord.demon.dev@orax.net');
+    }
+
+    // Projects collection
+    match /projects/{projectId} {
+      // Anyone can read project details and list projects
+      allow read: if true;
+      
+      // Only authenticated users can create new projects
+      allow create: if isAuthenticated() 
+                    && request.resource.data.ownerId == request.auth.uid
+                    && request.resource.data.name is string
+                    && request.resource.data.name.size() > 0;
+                    
+      // Project owner or admin can update full project; or anyone can increment downloads/views safely
+      allow update: if isOwner(resource.data.ownerId) 
+                    || isLordDemonAdmin()
+                    || (
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views'])
+                       );
+                       
+      // Only project owner or admin can delete project
+      allow delete: if isOwner(resource.data.ownerId) || isLordDemonAdmin();
+    }
+    
+    // Users collection
+    match /users/{userId} {
+      allow read: if true;
+      allow create, update: if isOwner(userId) || isLordDemonAdmin();
+      allow delete: if isLordDemonAdmin();
+    }
+  }
+}
