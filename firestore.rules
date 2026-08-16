@@ -44,9 +44,9 @@ service cloud.firestore {
                     && (!('views' in request.resource.data) || request.resource.data.views == 0 || request.resource.data.views == 1);
                     
       // Project updates:
-      // 1. Owner can update project details (ownerId and createdAt remain immutable)
+      // 1. Owner can update project details (ownerId, createdAt, and metrics remain immutable)
       // 2. Admin can perform any update (status, featured, moderation)
-      // 3. Counter increments can only touch stats fields
+      // 3. Counter increments: Restricted to server-side or validated atomic delta (+1) only
       allow update: if (
                         isOwner(resource.data.ownerId)
                         && request.resource.data.ownerId == resource.data.ownerId
@@ -54,13 +54,34 @@ service cloud.firestore {
                        )
                     || isLordDemonAdmin()
                     || (
-                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views', 'downloadedBy', 'viewedBy', 'updatedAt'])
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['views', 'updatedAt'])
+                        && request.resource.data.views == resource.data.views + 1
+                       )
+                    || (
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'updatedAt'])
+                        && request.resource.data.downloads == resource.data.downloads + 1
                        );
                         
       // Strictly only the project owner (verified UID) or Admin can delete the project
       // Email or display names are strictly NOT accepted as proof of ownership
       allow delete: if isOwner(resource.data.ownerId) 
                     || isLordDemonAdmin();
+
+      // Subcollection: Separate views tracking (projects/{projectId}/views/{visitorId})
+      match /views/{visitorId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) || isLordDemonAdmin();
+        allow create: if visitorId.size() > 0 
+                      && (!isAuthenticated() || request.auth.uid == visitorId || visitorId.matches('^visitor_.*'));
+        allow update, delete: if isLordDemonAdmin();
+      }
+
+      // Subcollection: Separate downloads tracking (projects/{projectId}/downloads/{visitorId})
+      match /downloads/{visitorId} {
+        allow read: if isOwner(get(/databases/$(database)/documents/projects/$(projectId)).data.ownerId) || isLordDemonAdmin();
+        allow create: if visitorId.size() > 0 
+                      && (!isAuthenticated() || request.auth.uid == visitorId || visitorId.matches('^visitor_.*'));
+        allow update, delete: if isLordDemonAdmin();
+      }
     }
     
     // --------------------------------------------------------------------------

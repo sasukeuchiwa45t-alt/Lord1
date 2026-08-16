@@ -24,7 +24,7 @@ import {
   updateDoc,
   deleteDoc,
   increment,
-  arrayUnion,
+  runTransaction,
   query,
   orderBy,
   onSnapshot,
@@ -819,7 +819,8 @@ export async function deleteExistingProject(id: string, userId: string): Promise
 }
 
 // --------------------------------------------------------------------------
-// UNIQUE VIEW & DOWNLOAD TRACKING PER ACCOUNT / VISITOR
+// SECURE UNIQUE VIEW & DOWNLOAD TRACKING PER ACCOUNT / VISITOR
+// (Uses Serverless Function + Subcollection verification + Atomic transactions)
 // --------------------------------------------------------------------------
 
 const STORAGE_KEY_USER_VIEWS = 'orax_unique_user_views';
@@ -833,12 +834,13 @@ export function getVisitorIdentifier(customUserId?: string): string {
   if (customUserId && customUserId.trim()) {
     return customUserId.trim();
   }
+  const authUser = auth?.currentUser;
+  if (authUser?.uid) {
+    return authUser.uid;
+  }
   const session = getLocalSession();
   if (session?.uid) {
     return session.uid;
-  }
-  if (session?.email) {
-    return session.email.toLowerCase();
   }
   try {
     let guestId = localStorage.getItem(STORAGE_KEY_GUEST_ID);
@@ -848,14 +850,11 @@ export function getVisitorIdentifier(customUserId?: string): string {
     }
     return guestId;
   } catch {
-    return 'visitor_default';
+    return 'visitor_guest';
   }
 }
 
-function hasUserViewedProject(projectId: string, visitorId: string, project?: Project | null): boolean {
-  if (project?.viewedBy && Array.isArray(project.viewedBy) && project.viewedBy.includes(visitorId)) {
-    return true;
-  }
+function hasUserViewedProjectLocally(projectId: string, visitorId: string): boolean {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_USER_VIEWS);
     if (raw) {
@@ -886,10 +885,7 @@ function markProjectAsViewedLocally(projectId: string, visitorId: string): void 
   }
 }
 
-function hasUserDownloadedProject(projectId: string, visitorId: string, project?: Project | null): boolean {
-  if (project?.downloadedBy && Array.isArray(project.downloadedBy) && project.downloadedBy.includes(visitorId)) {
-    return true;
-  }
+function hasUserDownloadedProjectLocally(projectId: string, visitorId: string): boolean {
   try {
     const raw = localStorage.getItem(STORAGE_KEY_USER_DOWNLOADS);
     if (raw) {
@@ -920,55 +916,133 @@ function markProjectAsDownloadedLocally(projectId: string, visitorId: string): v
   }
 }
 
+// In-memory anti-spam debounce maps
+const recentViewCalls = new Map<string, number>();
+const recentDownloadCalls = new Map<string, number>();
+
 /**
  * Increments project downloads ONLY ONCE per user account / visitor.
- * If the user has already downloaded this project, returns the current count without adding +1.
+ * Controlled server-side with atomic verification in projects/{projectId}/downloads/{visitorId}.
  */
 export async function recordProjectDownload(
   id: string, 
   customUserId?: string
 ): Promise<{ downloads: number; isNew: boolean }> {
   const visitorId = getVisitorIdentifier(customUserId);
+  const debounceKey = `${id}_${visitorId}`;
+  const nowMs = Date.now();
+
+  // Rapid click / spam protection: Ignore requests within 2.5 seconds
+  if (recentDownloadCalls.has(debounceKey) && nowMs - (recentDownloadCalls.get(debounceKey) || 0) < 2500) {
+    const projects = getLocalProjects();
+    const current = projects.find(p => p.id === id);
+    return { downloads: current?.downloads || 0, isNew: false };
+  }
+  recentDownloadCalls.set(debounceKey, nowMs);
+
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
   const targetProject = index !== -1 ? projects[index] : null;
 
-  // Check if this account/visitor already downloaded this project
-  if (hasUserDownloadedProject(id, visitorId, targetProject)) {
+  // 1. Fast local check to avoid redundant network hits
+  if (hasUserDownloadedProjectLocally(id, visitorId)) {
     return {
       downloads: targetProject?.downloads || 0,
       isNew: false,
     };
   }
 
-  // First time downloading: record for this user and increment
+  // Mark local optimistic cache
   markProjectAsDownloadedLocally(id, visitorId);
 
+  // 2. Try Netlify Serverless Function first for server-authoritative tracking
+  try {
+    const response = await fetch('/api/track-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: id,
+        type: 'download',
+        visitorId,
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (index !== -1) {
+        projects[index].downloads = data.count;
+        const clean = deduplicateProjects(projects);
+        saveLocalProjects(clean);
+        broadcastProjectsChange(clean);
+      }
+      return { downloads: data.count, isNew: data.isNew };
+    }
+  } catch {
+    // Fallback to direct client-side atomic Firestore transaction if function is unreachable
+  }
+
+  // 3. Fallback: Direct Firestore Atomic Transaction using Subcollections
+  if (db && isFirebaseConfigured()) {
+    try {
+      const projectRef = doc(db, 'projects', id);
+      const sanitizedVisitorId = visitorId.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 100);
+      const downloadTrackRef = doc(db, 'projects', id, 'downloads', sanitizedVisitorId);
+
+      const result = await runTransaction(db, async (transaction) => {
+        const [projectSnap, trackSnap] = await Promise.all([
+          transaction.get(projectRef),
+          transaction.get(downloadTrackRef),
+        ]);
+
+        if (!projectSnap.exists()) {
+          throw new Error('Projet introuvable');
+        }
+
+        const projectData = projectSnap.data();
+        const currentCount = projectData.downloads || 0;
+
+        if (trackSnap.exists()) {
+          return { downloads: currentCount, isNew: false };
+        }
+
+        const newCount = currentCount + 1;
+        const nowIso = new Date().toISOString();
+
+        transaction.set(downloadTrackRef, {
+          visitorId: sanitizedVisitorId,
+          createdAt: nowIso,
+          type: 'download',
+        });
+
+        transaction.update(projectRef, {
+          downloads: newCount,
+          updatedAt: nowIso,
+        });
+
+        return { downloads: newCount, isNew: true };
+      });
+
+      if (index !== -1) {
+        projects[index].downloads = result.downloads;
+        const clean = deduplicateProjects(projects);
+        saveLocalProjects(clean);
+        broadcastProjectsChange(clean);
+      }
+
+      return result;
+    } catch (err) {
+      console.warn('Firestore direct transaction fallback notice:', err);
+    }
+  }
+
+  // 4. Offline / Local fallback
   let updatedDownloads = 1;
   if (index !== -1) {
     projects[index].downloads = (projects[index].downloads || 0) + 1;
-    if (!projects[index].downloadedBy) {
-      projects[index].downloadedBy = [];
-    }
-    if (!projects[index].downloadedBy.includes(visitorId)) {
-      projects[index].downloadedBy.push(visitorId);
-    }
     updatedDownloads = projects[index].downloads;
     const clean = deduplicateProjects(projects);
     saveLocalProjects(clean);
     broadcastProjectsChange(clean);
-  }
-
-  if (db && isFirebaseConfigured()) {
-    try {
-      const docRef = doc(db, 'projects', id);
-      await updateDoc(docRef, { 
-        downloads: increment(1),
-        downloadedBy: arrayUnion(visitorId)
-      });
-    } catch (err) {
-      console.warn('Firestore download increment warning:', err);
-    }
   }
 
   return { downloads: updatedDownloads, isNew: true };
@@ -976,53 +1050,127 @@ export async function recordProjectDownload(
 
 /**
  * Increments project views ONLY ONCE per user account / visitor.
- * If the user has already visited/opened this project, returns current views without adding +1.
+ * Controlled server-side with atomic verification in projects/{projectId}/views/{visitorId}.
  */
 export async function recordProjectView(
   id: string, 
   customUserId?: string
 ): Promise<{ views: number; isNew: boolean }> {
   const visitorId = getVisitorIdentifier(customUserId);
+  const debounceKey = `${id}_${visitorId}`;
+  const nowMs = Date.now();
+
+  // Rapid view / refresh spam protection: Ignore repeat calls within 2.5 seconds
+  if (recentViewCalls.has(debounceKey) && nowMs - (recentViewCalls.get(debounceKey) || 0) < 2500) {
+    const projects = getLocalProjects();
+    const current = projects.find(p => p.id === id);
+    return { views: current?.views || 1, isNew: false };
+  }
+  recentViewCalls.set(debounceKey, nowMs);
+
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
   const targetProject = index !== -1 ? projects[index] : null;
 
-  // Check if this account/visitor already viewed this project
-  if (hasUserViewedProject(id, visitorId, targetProject)) {
+  // 1. Fast local check
+  if (hasUserViewedProjectLocally(id, visitorId)) {
     return {
       views: targetProject?.views || 1,
       isNew: false,
     };
   }
 
-  // First time viewing: record for this user and increment
+  // Mark local optimistic cache
   markProjectAsViewedLocally(id, visitorId);
 
+  // 2. Try Netlify Serverless Function first
+  try {
+    const response = await fetch('/api/track-event', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        projectId: id,
+        type: 'view',
+        visitorId,
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (index !== -1) {
+        projects[index].views = data.count;
+        const clean = deduplicateProjects(projects);
+        saveLocalProjects(clean);
+        broadcastProjectsChange(clean);
+      }
+      return { views: data.count, isNew: data.isNew };
+    }
+  } catch {
+    // Fallback to direct client-side atomic Firestore transaction if function is unreachable
+  }
+
+  // 3. Fallback: Direct Firestore Atomic Transaction using Subcollections
+  if (db && isFirebaseConfigured()) {
+    try {
+      const projectRef = doc(db, 'projects', id);
+      const sanitizedVisitorId = visitorId.replace(/[^a-zA-Z0-9_-]/g, '_').substring(0, 100);
+      const viewTrackRef = doc(db, 'projects', id, 'views', sanitizedVisitorId);
+
+      const result = await runTransaction(db, async (transaction) => {
+        const [projectSnap, trackSnap] = await Promise.all([
+          transaction.get(projectRef),
+          transaction.get(viewTrackRef),
+        ]);
+
+        if (!projectSnap.exists()) {
+          throw new Error('Projet introuvable');
+        }
+
+        const projectData = projectSnap.data();
+        const currentCount = projectData.views || 1;
+
+        if (trackSnap.exists()) {
+          return { views: currentCount, isNew: false };
+        }
+
+        const newCount = currentCount + 1;
+        const nowIso = new Date().toISOString();
+
+        transaction.set(viewTrackRef, {
+          visitorId: sanitizedVisitorId,
+          createdAt: nowIso,
+          type: 'view',
+        });
+
+        transaction.update(projectRef, {
+          views: newCount,
+          updatedAt: nowIso,
+        });
+
+        return { views: newCount, isNew: true };
+      });
+
+      if (index !== -1) {
+        projects[index].views = result.views;
+        const clean = deduplicateProjects(projects);
+        saveLocalProjects(clean);
+        broadcastProjectsChange(clean);
+      }
+
+      return result;
+    } catch (err) {
+      console.warn('Firestore direct transaction fallback notice:', err);
+    }
+  }
+
+  // 4. Offline / Local fallback
   let updatedViews = 1;
   if (index !== -1) {
     projects[index].views = (projects[index].views || 0) + 1;
-    if (!projects[index].viewedBy) {
-      projects[index].viewedBy = [];
-    }
-    if (!projects[index].viewedBy.includes(visitorId)) {
-      projects[index].viewedBy.push(visitorId);
-    }
     updatedViews = projects[index].views;
     const clean = deduplicateProjects(projects);
     saveLocalProjects(clean);
     broadcastProjectsChange(clean);
-  }
-
-  if (db && isFirebaseConfigured()) {
-    try {
-      const docRef = doc(db, 'projects', id);
-      await updateDoc(docRef, { 
-        views: increment(1),
-        viewedBy: arrayUnion(visitorId)
-      });
-    } catch (err) {
-      console.warn('Firestore view increment warning:', err);
-    }
   }
 
   return { views: updatedViews, isNew: true };
