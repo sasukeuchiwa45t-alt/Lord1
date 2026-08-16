@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { 
   Upload, 
   Search, 
@@ -13,10 +13,12 @@ import {
   Check, 
   ShieldCheck, 
   Cloud,
+  CloudOff,
+  RefreshCw,
   ChevronDown
 } from 'lucide-react';
-import { UserProfile } from '../types';
-import { isFirebaseConfigured } from '../services/firebase';
+import { UserProfile, CloudSyncState } from '../types';
+import { isFirebaseConfigured, subscribeToSyncStatus } from '../services/firebase';
 
 interface HeaderProps {
   currentTab: string;
@@ -41,7 +43,15 @@ export const Header: React.FC<HeaderProps> = ({
 }) => {
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const [userDropdownOpen, setUserDropdownOpen] = useState(false);
+  const [syncStatus, setSyncStatus] = useState<CloudSyncState>('synced');
   const isCloudActive = isFirebaseConfigured();
+
+  useEffect(() => {
+    const unsub = subscribeToSyncStatus((status) => {
+      setSyncStatus(status);
+    });
+    return () => unsub();
+  }, []);
 
   const handleNavClick = (tab: string) => {
     onNavigate(tab);
@@ -69,9 +79,35 @@ export const Header: React.FC<HeaderProps> = ({
                 <span className="font-extrabold tracking-tight text-lg sm:text-xl text-white font-mono">
                   ORAX<span className="text-cyan-400">PROJET</span>
                 </span>
-                <span className="hidden sm:inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-cyan-950/80 text-cyan-400 border border-cyan-800/50">
-                  v2.4
-                </span>
+                
+                {/* Sync & Connectivity State Pill */}
+                {syncStatus === 'synced' && isCloudActive && (
+                  <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-emerald-950/80 text-emerald-400 border border-emerald-800/60" title="Firestore connecté & synchronisé">
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                    Synchronisé
+                  </span>
+                )}
+
+                {syncStatus === 'syncing' && (
+                  <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-cyan-950/80 text-cyan-400 border border-cyan-800/60" title="Synchronisation Firestore en cours...">
+                    <RefreshCw className="w-2.5 h-2.5 animate-spin" />
+                    Synchronisation
+                  </span>
+                )}
+
+                {(syncStatus === 'offline' || !isCloudActive) && (
+                  <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-amber-950/80 text-amber-400 border border-amber-800/60" title="Mode hors connexion - Cache local actif">
+                    <CloudOff className="w-2.5 h-2.5" />
+                    Hors connexion (Cache)
+                  </span>
+                )}
+
+                {syncStatus === 'error' && (
+                  <span className="hidden sm:inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium bg-rose-950/80 text-rose-400 border border-rose-800/60" title="Erreur de connexion Firestore">
+                    <CloudOff className="w-2.5 h-2.5" />
+                    Non synchronisé
+                  </span>
+                )}
               </div>
               <p className="text-[10px] text-zinc-400 -mt-0.5 hidden xs:block">
                 Plateforme de Partage Dev
@@ -343,6 +379,35 @@ export const Header: React.FC<HeaderProps> = ({
                 <Flame className="w-4 h-4 text-amber-400" />
                 Populaires
               </button>
+            </div>
+
+            {/* Mobile Sync Indicator */}
+            <div className="flex items-center justify-between px-3 py-2 rounded-xl bg-zinc-900/60 border border-zinc-800/80 text-xs">
+              <span className="text-zinc-400">Base de données :</span>
+              {syncStatus === 'synced' && isCloudActive && (
+                <span className="inline-flex items-center gap-1.5 font-medium text-emerald-400">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                  Firestore Connecté
+                </span>
+              )}
+              {syncStatus === 'syncing' && (
+                <span className="inline-flex items-center gap-1.5 font-medium text-cyan-400">
+                  <RefreshCw className="w-3 h-3 animate-spin" />
+                  Synchronisation...
+                </span>
+              )}
+              {(syncStatus === 'offline' || !isCloudActive) && (
+                <span className="inline-flex items-center gap-1.5 font-medium text-amber-400">
+                  <CloudOff className="w-3 h-3" />
+                  Hors ligne (Cache Local)
+                </span>
+              )}
+              {syncStatus === 'error' && (
+                <span className="inline-flex items-center gap-1.5 font-medium text-rose-400">
+                  <CloudOff className="w-3 h-3" />
+                  Non synchronisé
+                </span>
+              )}
             </div>
 
             {currentUser ? (

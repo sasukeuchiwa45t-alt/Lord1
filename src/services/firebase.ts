@@ -30,7 +30,7 @@ import {
   onSnapshot,
   Firestore
 } from 'firebase/firestore';
-import { Project, UserProfile, ProjectReport, ProjectStatus, ReportStatus } from '../types';
+import { Project, UserProfile, ProjectReport, ProjectStatus, ReportStatus, CloudSyncState } from '../types';
 import { deleteStoredFile } from '../utils/fileStorage';
 
 const firebaseConfig = {
@@ -78,6 +78,46 @@ if (isFirebaseConfigured()) {
   }
 }
 
+// --------------------------------------------------------------------------
+// CLOUD SYNCHRONIZATION STATE LISTENER
+// --------------------------------------------------------------------------
+let currentSyncStatus: CloudSyncState = isFirebaseConfigured() ? (navigator.onLine ? 'synced' : 'offline') : 'offline';
+const SYNC_STATUS_EVENT = 'orax_sync_status_changed';
+
+export function getSyncStatus(): CloudSyncState {
+  return currentSyncStatus;
+}
+
+export function updateSyncStatus(newStatus: CloudSyncState): void {
+  if (currentSyncStatus !== newStatus) {
+    currentSyncStatus = newStatus;
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent(SYNC_STATUS_EVENT, { detail: newStatus }));
+    }
+  }
+}
+
+export function subscribeToSyncStatus(callback: (status: CloudSyncState) => void): () => void {
+  callback(currentSyncStatus);
+  const handler = (e: Event) => {
+    const custom = e as CustomEvent<CloudSyncState>;
+    callback(custom.detail || currentSyncStatus);
+  };
+  window.addEventListener(SYNC_STATUS_EVENT, handler);
+  
+  const onlineHandler = () => updateSyncStatus(isFirebaseConfigured() ? 'synced' : 'offline');
+  const offlineHandler = () => updateSyncStatus('offline');
+  
+  window.addEventListener('online', onlineHandler);
+  window.addEventListener('offline', offlineHandler);
+
+  return () => {
+    window.removeEventListener(SYNC_STATUS_EVENT, handler);
+    window.removeEventListener('online', onlineHandler);
+    window.removeEventListener('offline', offlineHandler);
+  };
+}
+
 // Admin email configured for LORD DEMON admin privileges
 const ADMIN_EMAILS = new Set(['epargnelock@gmail.com', 'lord.demon.dev@orax.net']);
 
@@ -88,7 +128,6 @@ export function checkIsAdmin(
   if (!user) return false;
   if (hasCustomClaimAdmin === true) return true;
   if (user.email && ADMIN_EMAILS.has(user.email.toLowerCase())) return true;
-  if (user.uid === 'dev_lord_demon') return true;
   return false;
 }
 
@@ -108,12 +147,12 @@ function sanitizeForFirestore<T extends Record<string, any>>(obj: T): T {
 }
 
 // --------------------------------------------------------------------------
-// LOCAL PERSISTENCE ENGINE & DE-DUPLICATION
+// LOCAL CACHE ONLY (Used for instant UI paint & offline fallback)
+// Firestore is the sole SOURCE OF TRUTH.
 // --------------------------------------------------------------------------
 const STORAGE_KEY_PROJECTS = 'orax_projet_items_v2';
-const STORAGE_KEY_USERS = 'orax_projet_users_v2';
 const STORAGE_KEY_REPORTS = 'orax_projet_reports_v2';
-const STORAGE_KEY_SESSION = 'orax_projet_current_user_v2';
+const STORAGE_KEY_SESSION_UI = 'orax_projet_cached_session_v2';
 
 const DEMO_PROJECT_IDS = new Set([
   'orax-bot-v2',
@@ -160,18 +199,6 @@ function saveLocalProjects(projects: Project[]): void {
   localStorage.setItem(STORAGE_KEY_PROJECTS, JSON.stringify(unique));
 }
 
-function getLocalUsers(): UserProfile[] {
-  try {
-    const saved = localStorage.getItem(STORAGE_KEY_USERS);
-    if (saved) {
-      return JSON.parse(saved);
-    }
-  } catch {
-    // Ignore
-  }
-  return [];
-}
-
 function getLocalReports(): ProjectReport[] {
   try {
     const saved = localStorage.getItem(STORAGE_KEY_REPORTS);
@@ -188,9 +215,9 @@ function saveLocalReports(reports: ProjectReport[]): void {
   localStorage.setItem(STORAGE_KEY_REPORTS, JSON.stringify(reports));
 }
 
-function getLocalSession(): UserProfile | null {
+function getCachedSession(): UserProfile | null {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY_SESSION);
+    const saved = localStorage.getItem(STORAGE_KEY_SESSION_UI);
     if (saved) {
       const parsed = JSON.parse(saved);
       parsed.isAdmin = checkIsAdmin(parsed);
@@ -202,17 +229,17 @@ function getLocalSession(): UserProfile | null {
   return null;
 }
 
-function saveLocalSession(user: UserProfile | null): void {
+function saveCachedSession(user: UserProfile | null): void {
   if (user) {
     user.isAdmin = checkIsAdmin(user);
-    localStorage.setItem(STORAGE_KEY_SESSION, JSON.stringify(user));
+    localStorage.setItem(STORAGE_KEY_SESSION_UI, JSON.stringify(user));
   } else {
-    localStorage.removeItem(STORAGE_KEY_SESSION);
+    localStorage.removeItem(STORAGE_KEY_SESSION_UI);
   }
 }
 
 // --------------------------------------------------------------------------
-// AUTHENTICATION METHODS
+// AUTHENTICATION METHODS (Strictly Firebase Auth - No Mock Account Creation)
 // --------------------------------------------------------------------------
 
 export function translateFirebaseError(error: any): string {
@@ -246,133 +273,94 @@ export async function registerUser(
   displayName: string,
   customPhotoURL?: string
 ): Promise<UserProfile> {
+  if (!auth || !isFirebaseConfigured()) {
+    throw new Error('Service d\'authentification Firebase non configuré. Veuillez vérifier la configuration réseau.');
+  }
+
   const finalPhotoURL = customPhotoURL || `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(displayName || email)}`;
   const cleanDisplayName = displayName.trim() || email.split('@')[0];
   const isAdmin = ADMIN_EMAILS.has(email.toLowerCase());
 
-  if (auth && isFirebaseConfigured()) {
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, password);
+    
     try {
-      const cred = await createUserWithEmailAndPassword(auth, email, password);
-      
-      try {
-        await updateProfile(cred.user, { 
-          displayName: cleanDisplayName,
-          photoURL: finalPhotoURL
-        });
-      } catch (profileErr) {
-        console.warn('Profile update notice (non-blocking):', profileErr);
-      }
-      
-      const userProfile: UserProfile = {
-        uid: cred.user.uid,
-        email: cred.user.email || email,
+      await updateProfile(cred.user, { 
         displayName: cleanDisplayName,
-        photoURL: finalPhotoURL,
-        createdAt: new Date().toISOString(),
-        projectsCount: 0,
-        totalDownloads: 0,
-        isAdmin,
-      };
-
-      if (db) {
-        // Asynchronously save to Firestore without blocking user creation flow
-        setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
-          .catch((err) => console.warn('Firestore setDoc user warning (non-blocking):', err));
-      }
-      
-      saveLocalSession(userProfile);
-      return userProfile;
-    } catch (err: any) {
-      throw new Error(translateFirebaseError(err));
+        photoURL: finalPhotoURL
+      });
+    } catch (profileErr) {
+      console.warn('Profile update notice (non-blocking):', profileErr);
     }
-  }
-
-  // Local fallback registration
-  const users = getLocalUsers();
-  const existing = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  if (existing) {
-    throw new Error('Cette adresse e-mail est déjà utilisée.');
-  }
-
-  const newUser: UserProfile = {
-    uid: `user_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
-    email,
-    displayName: cleanDisplayName,
-    photoURL: finalPhotoURL,
-    createdAt: new Date().toISOString(),
-    projectsCount: 0,
-    totalDownloads: 0,
-    isAdmin,
-  };
-
-  users.push(newUser);
-  localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(users));
-  saveLocalSession(newUser);
-  return newUser;
-}
-
-export async function loginUser(email: string, password: string): Promise<UserProfile> {
-  const defaultPhotoURL = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(email)}`;
-  const isAdmin = ADMIN_EMAILS.has(email.toLowerCase());
-
-  if (auth && isFirebaseConfigured()) {
-    try {
-      const cred = await signInWithEmailAndPassword(auth, email, password);
-      let userProfile: UserProfile = {
-        uid: cred.user.uid,
-        email: cred.user.email || email,
-        displayName: cred.user.displayName || email.split('@')[0],
-        photoURL: cred.user.photoURL || defaultPhotoURL,
-        createdAt: new Date().toISOString(),
-        projectsCount: 0,
-        totalDownloads: 0,
-        isAdmin,
-      };
-
-      if (db) {
-        try {
-          const userDoc = await getDoc(doc(db, 'users', cred.user.uid));
-          if (userDoc.exists()) {
-            userProfile = { ...userProfile, ...(userDoc.data() as UserProfile) };
-          } else {
-            setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
-              .catch((err) => console.warn('Firestore user init warning:', err));
-          }
-        } catch {
-          // Continue with auth profile
-        }
-      }
-      
-      userProfile.isAdmin = checkIsAdmin(userProfile);
-      saveLocalSession(userProfile);
-      return userProfile;
-    } catch (err: any) {
-      throw new Error(translateFirebaseError(err));
-    }
-  }
-
-  // Local fallback login
-  const users = getLocalUsers();
-  let found = users.find(u => u.email.toLowerCase() === email.toLowerCase());
-  
-  if (!found) {
-    found = {
-      uid: `user_${Date.now()}`,
-      email,
-      displayName: email.split('@')[0],
-      photoURL: defaultPhotoURL,
+    
+    const userProfile: UserProfile = {
+      uid: cred.user.uid,
+      email: cred.user.email || email,
+      displayName: cleanDisplayName,
+      photoURL: finalPhotoURL,
       createdAt: new Date().toISOString(),
       projectsCount: 0,
       totalDownloads: 0,
       isAdmin,
     };
-    users.push(found);
-    localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(users));
+
+    if (db) {
+      // Save to Firestore users collection
+      try {
+        await setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile));
+      } catch (err) {
+        console.warn('Firestore setDoc user warning:', err);
+      }
+    }
+    
+    saveCachedSession(userProfile);
+    return userProfile;
+  } catch (err: any) {
+    throw new Error(translateFirebaseError(err));
+  }
+}
+
+export async function loginUser(email: string, password: string): Promise<UserProfile> {
+  if (!auth || !isFirebaseConfigured()) {
+    throw new Error('Service d\'authentification Firebase non configuré. Impossible de se connecter.');
   }
 
-  found.isAdmin = checkIsAdmin(found);
-  saveLocalSession(found);
-  return found;
+  const defaultPhotoURL = `https://api.dicebear.com/7.x/bottts/svg?seed=${encodeURIComponent(email)}`;
+  const isAdmin = ADMIN_EMAILS.has(email.toLowerCase());
+
+  try {
+    const cred = await signInWithEmailAndPassword(auth, email, password);
+    let userProfile: UserProfile = {
+      uid: cred.user.uid,
+      email: cred.user.email || email,
+      displayName: cred.user.displayName || email.split('@')[0],
+      photoURL: cred.user.photoURL || defaultPhotoURL,
+      createdAt: new Date().toISOString(),
+      projectsCount: 0,
+      totalDownloads: 0,
+      isAdmin,
+    };
+
+    if (db) {
+      try {
+        const userDoc = await getDoc(doc(db, 'users', cred.user.uid));
+        if (userDoc.exists()) {
+          userProfile = { ...userProfile, ...(userDoc.data() as UserProfile) };
+        } else {
+          setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
+            .catch((err) => console.warn('Firestore user init warning:', err));
+        }
+      } catch {
+        // Continue with auth profile
+      }
+    }
+    
+    userProfile.isAdmin = checkIsAdmin(userProfile);
+    saveCachedSession(userProfile);
+    return userProfile;
+  } catch (err: any) {
+    throw new Error(translateFirebaseError(err));
+  }
 }
 
 export async function updateUserProfile(
@@ -380,67 +368,53 @@ export async function updateUserProfile(
   updates: Partial<UserProfile>
 ): Promise<UserProfile> {
   const authUser = auth?.currentUser;
-  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
-
-  // Security: only the profile owner (verified Auth UID) or Admin can update
-  if (authUser && authUser.uid !== userId && !isAdmin) {
+  if (!authUser || (authUser.uid !== userId && !checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }))) {
     throw new Error('Vous n\'êtes pas autorisé à modifier ce profil.');
   }
+
+  const isAdmin = checkIsAdmin({ email: authUser.email || '', uid: authUser.uid });
 
   // Security: Prevent privilege escalation and immutable UID modification
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { isAdmin: _attemptedAdmin, uid: _ignoredUid, ...safeUpdates } = updates;
-  const currentSession = getLocalSession();
-
-  const finalIsAdmin = isAdmin || (currentSession?.uid === userId && checkIsAdmin(currentSession));
+  const currentSession = getCachedSession();
 
   const updatedProfile: UserProfile = {
     ...(currentSession || {
       uid: userId,
-      email: '',
-      displayName: 'Dev',
+      email: authUser.email || '',
+      displayName: authUser.displayName || 'Dev',
       createdAt: new Date().toISOString(),
     }),
     ...safeUpdates,
     uid: userId,
-    isAdmin: finalIsAdmin,
+    isAdmin,
   };
 
   // 1. Update Firebase Auth if user is currently logged in
-  if (auth && auth.currentUser && auth.currentUser.uid === userId) {
+  if (authUser.uid === userId) {
     try {
       const authUpdates: { displayName?: string; photoURL?: string } = {};
       if (safeUpdates.displayName) authUpdates.displayName = safeUpdates.displayName;
       if (safeUpdates.photoURL) authUpdates.photoURL = safeUpdates.photoURL;
       if (Object.keys(authUpdates).length > 0) {
-        await updateProfile(auth.currentUser, authUpdates);
+        await updateProfile(authUser, authUpdates);
       }
     } catch (err) {
       console.warn('Firebase Auth updateProfile warning:', err);
     }
   }
 
-  // 2. Update Firestore document
+  // 2. Update Firestore document (Source of Truth)
   if (db && isFirebaseConfigured()) {
     try {
-      setDoc(doc(db, 'users', userId), sanitizeForFirestore(updatedProfile), { merge: true })
-        .catch((err) => console.warn('Firestore updateUserProfile warning:', err));
-    } catch (err) {
-      console.warn('Firestore update error:', err);
+      await setDoc(doc(db, 'users', userId), sanitizeForFirestore(updatedProfile), { merge: true });
+    } catch (err: any) {
+      throw new Error(err?.message || 'Échec de la mise à jour du profil sur Firestore.');
     }
   }
 
-  // 3. Update Local Storage list and session
-  const users = getLocalUsers();
-  const idx = users.findIndex(u => u.uid === userId);
-  if (idx !== -1) {
-    users[idx] = updatedProfile;
-  } else {
-    users.push(updatedProfile);
-  }
-  localStorage.setItem(STORAGE_KEY_USERS, JSON.stringify(users));
-  saveLocalSession(updatedProfile);
-
+  saveCachedSession(updatedProfile);
   return updatedProfile;
 }
 
@@ -452,23 +426,28 @@ export async function logoutUser(): Promise<void> {
       // Ignore
     }
   }
-  saveLocalSession(null);
+  saveCachedSession(null);
 }
 
 export async function resetUserPassword(email: string): Promise<void> {
-  if (auth && isFirebaseConfigured()) {
-    try {
-      await sendPasswordResetEmail(auth, email);
-      return;
-    } catch (err: any) {
-      throw new Error(translateFirebaseError(err));
-    }
+  if (!auth || !isFirebaseConfigured()) {
+    throw new Error('Service d\'authentification non disponible pour la réinitialisation.');
   }
-  // Local simulator delay
-  await new Promise(r => setTimeout(r, 600));
+
+  try {
+    await sendPasswordResetEmail(auth, email);
+  } catch (err: any) {
+    throw new Error(translateFirebaseError(err));
+  }
 }
 
 export function subscribeToAuth(callback: (user: UserProfile | null) => void): () => void {
+  // First paint with cached session for UX responsiveness
+  const cached = getCachedSession();
+  if (cached) {
+    callback(cached);
+  }
+
   if (auth && isFirebaseConfigured()) {
     return onAuthStateChanged(auth, async (fbUser: FirebaseUser | null) => {
       if (fbUser) {
@@ -500,33 +479,25 @@ export function subscribeToAuth(callback: (user: UserProfile | null) => void): (
               profile = { 
                 ...profile, 
                 ...userData,
-                // Security: isAdmin is always computed from verified Auth claims and ADMIN_EMAILS
                 isAdmin,
               };
             }
           } catch {
-            // fallback to default profile
+            // fallback to auth profile
           }
         }
         profile.isAdmin = isAdmin;
-        saveLocalSession(profile);
+        saveCachedSession(profile);
         callback(profile);
       } else {
-        saveLocalSession(null);
+        saveCachedSession(null);
         callback(null);
       }
     });
   }
 
-  // Local storage auth subscriber
-  const current = getLocalSession();
-  callback(current);
-
-  const handleStorage = () => {
-    callback(getLocalSession());
-  };
-  window.addEventListener('storage', handleStorage);
-  return () => window.removeEventListener('storage', handleStorage);
+  callback(null);
+  return () => {};
 }
 
 // --------------------------------------------------------------------------
@@ -630,23 +601,26 @@ export function subscribeToProjects(callback: (projects: Project[]) => void): ()
 }
 
 export async function getProjects(): Promise<Project[]> {
-  if (db && isFirebaseConfigured()) {
-    try {
-      const q = query(collection(db, 'projects'), orderBy('createdAt', 'desc'));
-      const fetchPromise = getDocs(q);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Firestore timeout')), 2500)
-      );
-      const snapshot = await Promise.race([fetchPromise, timeoutPromise]);
-      if (snapshot && !snapshot.empty) {
-        const fetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Project));
-        const realOnly = deduplicateProjects(fetched);
-        saveLocalProjects(realOnly);
-        return realOnly;
-      }
-    } catch (err) {
-      // Graceful offline fallback
+  if (!db || !isFirebaseConfigured()) {
+    // If Firebase is not configured, fallback to cached data with offline sync state
+    updateSyncStatus('offline');
+    return getLocalProjects();
+  }
+
+  try {
+    updateSyncStatus('syncing');
+    const q = query(collection(db, 'projects'), orderBy('createdAt', 'desc'));
+    const snapshot = await getDocs(q);
+    if (snapshot) {
+      const fetched = snapshot.docs.map(d => ({ id: d.id, ...d.data() } as Project));
+      const realOnly = deduplicateProjects(fetched);
+      saveLocalProjects(realOnly);
+      updateSyncStatus(navigator.onLine ? 'synced' : 'offline');
+      return realOnly;
     }
+  } catch (err) {
+    updateSyncStatus(navigator.onLine ? 'error' : 'offline');
+    console.warn('Firestore getProjects network notice, using local cache:', err);
   }
 
   return getLocalProjects();
@@ -656,16 +630,12 @@ export async function getProjectById(id: string): Promise<Project | null> {
   if (db && isFirebaseConfigured()) {
     try {
       const docRef = doc(db, 'projects', id);
-      const fetchPromise = getDoc(docRef);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('Firestore timeout')), 2500)
-      );
-      const snapshot = await Promise.race([fetchPromise, timeoutPromise]);
+      const snapshot = await getDoc(docRef);
       if (snapshot && snapshot.exists()) {
         return { id: snapshot.id, ...snapshot.data() } as Project;
       }
     } catch (err) {
-      // Graceful offline fallback
+      console.warn('Firestore getProjectById notice, using cache:', err);
     }
   }
 
@@ -679,6 +649,10 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
   
   if (!verifiedOwnerId) {
     throw new Error('Vous devez être authentifié pour publier un projet.');
+  }
+
+  if (!db || !isFirebaseConfigured()) {
+    throw new Error('Impossible de publier le projet : la base de données Firestore n\'est pas connectée.');
   }
 
   const newId = `orax_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
@@ -700,80 +674,88 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
   // Mark author as having viewed this project locally
   markProjectAsViewedLocally(newId, verifiedOwnerId);
 
-  // 1. Immediately update local storage cache and broadcast for instant UI feedback
+  // 1. Mandatory Firestore Confirmation (Source of Truth)
+  updateSyncStatus('syncing');
+  try {
+    await setDoc(doc(db, 'projects', newId), sanitizeForFirestore(newProject));
+    updateSyncStatus('synced');
+  } catch (err: any) {
+    updateSyncStatus('error');
+    throw new Error(err?.message || 'Échec de l\'enregistrement du projet sur Firestore. Publication annulée.');
+  }
+
+  // 2. Update local storage cache only AFTER Firestore confirmation
   const projects = getLocalProjects();
-  // Filter out any existing with same ID and prepend
   const updatedList = deduplicateProjects([newProject, ...projects]);
   saveLocalProjects(updatedList);
   broadcastProjectsChange(updatedList);
-
-  // 2. Synchronize to Firestore with timeout race
-  if (db && isFirebaseConfigured()) {
-    try {
-      const setDocPromise = setDoc(doc(db, 'projects', newId), sanitizeForFirestore(newProject));
-      const timeoutPromise = new Promise<void>((resolve) => setTimeout(resolve, 2500));
-      await Promise.race([setDocPromise, timeoutPromise]);
-    } catch (err) {
-      console.warn('Firestore save warning (persisted locally):', err);
-    }
-  }
 
   return newProject;
 }
 
 export async function updateExistingProject(id: string, updates: Partial<Project>): Promise<Project> {
-  const projects = getLocalProjects();
-  const index = projects.findIndex(p => p.id === id);
-  if (index === -1) {
-    throw new Error('Projet non trouvé pour la mise à jour.');
+  if (!db || !isFirebaseConfigured()) {
+    throw new Error('Impossible de modifier le projet : Firestore n\'est pas connecté.');
   }
 
-  const existingProject = projects[index];
+  const projects = getLocalProjects();
+  const existingProject = projects.find(p => p.id === id);
   const authUser = auth?.currentUser;
   const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
-  const isOwner = Boolean(authUser && existingProject.ownerId && existingProject.ownerId === authUser.uid);
+  const isOwner = Boolean(authUser && existingProject && existingProject.ownerId === authUser.uid);
 
-  if (authUser && !isOwner && !isAdmin) {
+  if (authUser && existingProject && !isOwner && !isAdmin) {
     throw new Error('Vous n\'êtes pas autorisé à modifier ce projet.');
   }
 
   // Security: Prevent tampering with immutable identifiers
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { ownerId: _ignoredOwnerId, createdAt: _ignoredCreatedAt, ...safeUpdates } = updates;
+  const { ownerId: _ignoredOwnerId, createdAt: _ignoredCreatedAt, id: _ignoredId, ...safeUpdates } = updates;
 
   const now = new Date().toISOString();
   const updatedData: Partial<Project> = { 
     ...safeUpdates, 
     updatedAt: now,
-    ownerId: existingProject.ownerId,
-    createdAt: existingProject.createdAt,
   };
 
-  projects[index] = { ...existingProject, ...updatedData };
-  const cleanList = deduplicateProjects(projects);
-  saveLocalProjects(cleanList);
-  broadcastProjectsChange(cleanList);
-  const updatedProject = projects[index];
+  // 1. Mandatory Firestore Confirmation (Source of Truth)
+  updateSyncStatus('syncing');
+  try {
+    const docRef = doc(db, 'projects', id);
+    await updateDoc(docRef, sanitizeForFirestore(updatedData));
+    updateSyncStatus('synced');
+  } catch (err: any) {
+    updateSyncStatus('error');
+    throw new Error(err?.message || 'Échec de la modification sur Firestore. Modifications non enregistrées.');
+  }
 
-  if (db && isFirebaseConfigured()) {
-    try {
-      const docRef = doc(db, 'projects', id);
-      await updateDoc(docRef, sanitizeForFirestore(updatedData));
-    } catch (err) {
-      console.warn('Firestore update error:', err);
-    }
+  // 2. Update Local Cache after server confirmation
+  const index = projects.findIndex(p => p.id === id);
+  let updatedProject: Project;
+  if (index !== -1) {
+    projects[index] = { ...projects[index], ...updatedData };
+    const cleanList = deduplicateProjects(projects);
+    saveLocalProjects(cleanList);
+    broadcastProjectsChange(cleanList);
+    updatedProject = projects[index];
+  } else {
+    updatedProject = { ...existingProject, ...updatedData } as Project;
   }
 
   return updatedProject;
 }
 
 export async function deleteExistingProject(id: string, userId: string): Promise<boolean> {
+  if (!db || !isFirebaseConfigured()) {
+    throw new Error('Impossible de supprimer le projet : Firestore n\'est pas connecté.');
+  }
+
   const projects = getLocalProjects();
   const project = projects.find(p => p.id === id);
   const authUser = auth?.currentUser;
-  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : userId === 'dev_lord_demon';
+  const isAdmin = authUser ? checkIsAdmin({ email: authUser.email || '', uid: authUser.uid }) : false;
 
-  // Strict ownership check: Only verified Auth UID (request.auth.uid == ownerId) or verified Admin
+  // Strict ownership check
   const isOwner = Boolean(
     project && 
     project.ownerId && 
@@ -787,12 +769,23 @@ export async function deleteExistingProject(id: string, userId: string): Promise
     throw new Error('Vous n\'êtes pas autorisé à supprimer ce projet.');
   }
 
-  // 1. Immediately remove from local storage & broadcast to UI
+  // 1. Mandatory Firestore Confirmation BEFORE visual/cache deletion
+  updateSyncStatus('syncing');
+  try {
+    const docRef = doc(db, 'projects', id);
+    await deleteDoc(docRef);
+    updateSyncStatus('synced');
+  } catch (err: any) {
+    updateSyncStatus('error');
+    throw new Error(err?.message || 'Échec de la suppression sur le serveur Firestore. Projet conservé.');
+  }
+
+  // 2. Remove from local storage cache & broadcast to UI only after server confirmation
   const updated = deduplicateProjects(projects.filter(p => p.id !== id));
   saveLocalProjects(updated);
   broadcastProjectsChange(updated);
 
-  // 2. Remove associated binary file from local IndexedDB
+  // 3. Remove associated binary file from local IndexedDB
   try {
     await deleteStoredFile(id);
     if (project?.fileUrl) {
@@ -800,19 +793,6 @@ export async function deleteExistingProject(id: string, userId: string): Promise
     }
   } catch (err) {
     console.warn('IndexedDB file cleanup notice:', err);
-  }
-
-  // 3. Delete from Firestore asynchronously with strict timeout so UI never hangs
-  if (db && isFirebaseConfigured()) {
-    try {
-      const docRef = doc(db, 'projects', id);
-      await Promise.race([
-        deleteDoc(docRef),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 3500))
-      ]);
-    } catch (err) {
-      console.warn('Firestore project deletion notice:', err);
-    }
   }
 
   return true;
@@ -838,7 +818,7 @@ export function getVisitorIdentifier(customUserId?: string): string {
   if (authUser?.uid) {
     return authUser.uid;
   }
-  const session = getLocalSession();
+  const session = getCachedSession();
   if (session?.uid) {
     return session.uid;
   }

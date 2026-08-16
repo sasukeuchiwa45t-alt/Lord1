@@ -93,6 +93,8 @@ export type ReportReason =
 
 export type ReportStatus = 'pending' | 'reviewed' | 'dismissed' | 'actioned';
 
+export type CloudSyncState = 'synced' | 'syncing' | 'offline' | 'error';
+
 export interface ProjectReport {
   id: string;
   projectId: string;
