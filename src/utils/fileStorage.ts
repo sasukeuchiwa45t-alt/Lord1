@@ -69,6 +69,22 @@ export async function saveFileToIndexedDB(id: string, file: File | Blob, fileNam
   }
 }
 
+export async function deleteStoredFile(id: string): Promise<void> {
+  try {
+    const db = await openDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    store.delete(id);
+
+    return new Promise((resolve) => {
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+    });
+  } catch (err) {
+    console.warn('Could not delete file from IndexedDB:', err);
+  }
+}
+
 export async function getFileFromIndexedDB(id: string): Promise<StoredFileRecord | null> {
   try {
     const db = await openDB();

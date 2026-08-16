@@ -30,6 +30,8 @@ export interface Project {
   thumbnail: string;
   downloads: number;
   views: number;
+  viewedBy?: string[];
+  downloadedBy?: string[];
   featured?: boolean;
   status?: ProjectStatus;
   demoUrl?: string;

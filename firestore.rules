@@ -30,15 +30,17 @@ service cloud.firestore {
                     && request.resource.data.name is string
                     && request.resource.data.name.size() > 0;
                     
-      // Project owner or admin can update full project; or atomic counter increments
+      // Project owner or admin can update full project; or atomic counter increments & unique viewers/downloaders
       allow update: if isOwner(resource.data.ownerId) 
                     || isLordDemonAdmin()
                     || (
-                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views'])
+                        request.resource.data.diff(resource.data).affectedKeys().hasOnly(['downloads', 'views', 'downloadedBy', 'viewedBy'])
                        );
                        
       // Only project owner or admin can delete project
-      allow delete: if isOwner(resource.data.ownerId) || isLordDemonAdmin();
+      allow delete: if isOwner(resource.data.ownerId) 
+                    || isLordDemonAdmin() 
+                    || (isAuthenticated() && request.auth.token.email == resource.data.ownerEmail);
     }
     
     // Moderation & Reports collection

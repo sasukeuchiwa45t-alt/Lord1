@@ -3,15 +3,16 @@ import { Project } from '../types';
 import { getFileFromIndexedDB } from './fileStorage';
 
 /**
- * Universal Mobile & Desktop Download Engine
- * Ensures that clicking "Télécharger" immediately initiates a real file download
- * into the user's phone or computer storage (e.g. /Download folder).
+ * Universal Mobile & Desktop Download Engine for ORAX PROJET
+ * Ensures immediate, unblocked file download across Android, iOS, Windows, macOS and Linux.
  */
 export async function triggerProjectDownload(project: Project): Promise<void> {
   const baseName = project.fileName || `${project.name.toLowerCase().replace(/[^a-z0-9]/gi, '_')}.zip`;
-  const cleanFileName = baseName.endsWith('.zip') ? baseName : `${baseName.replace(/\.[^/.]+$/, '')}.zip`;
+  const cleanFileName = baseName.includes('.') ? baseName : `${baseName}.zip`;
 
-  // Step 1: Check if the exact binary file exists in local IndexedDB storage
+  // -------------------------------------------------------------------------
+  // 1. Check local IndexedDB storage for original binary file
+  // -------------------------------------------------------------------------
   try {
     const idRecord = await getFileFromIndexedDB(project.id);
     if (idRecord && idRecord.data) {
@@ -27,44 +28,43 @@ export async function triggerProjectDownload(project: Project): Promise<void> {
       }
     }
   } catch (dbErr) {
-    console.warn('IndexedDB check notice:', dbErr);
+    console.warn('IndexedDB retrieval notice:', dbErr);
   }
 
-  // Step 2: If the fileUrl is a data URI or blob URL, try fetching it
-  if (project.fileUrl) {
-    // If it's a data URL
-    if (project.fileUrl.startsWith('data:')) {
+  // -------------------------------------------------------------------------
+  // 2. Handle Data URL (Base64)
+  // -------------------------------------------------------------------------
+  if (project.fileUrl && project.fileUrl.startsWith('data:')) {
+    try {
       const blob = dataUrlToBlob(project.fileUrl);
       downloadBlobDirectly(blob, cleanFileName);
       return;
-    }
-
-    // If it's a remote URL (Cloudinary or CDN)
-    if (project.fileUrl.startsWith('http://') || project.fileUrl.startsWith('https://')) {
-      try {
-        let fetchUrl = project.fileUrl;
-        // If Cloudinary URL, force attachment header
-        if (fetchUrl.includes('cloudinary.com') && !fetchUrl.includes('fl_attachment')) {
-          fetchUrl = fetchUrl.replace('/upload/', `/upload/fl_attachment:${encodeURIComponent(cleanFileName)}/`);
-        }
-
-        const res = await fetch(fetchUrl, { mode: 'cors' });
-        if (res.ok) {
-          const blob = await res.blob();
-          const zipBlob = new Blob([blob], { type: blob.type || 'application/zip' });
-          downloadBlobDirectly(zipBlob, cleanFileName);
-          return;
-        }
-      } catch (fetchErr) {
-        console.warn('Direct fetch notice, generating real package archive:', fetchErr);
-      }
+    } catch (err) {
+      console.warn('Data URL parse error:', err);
     }
   }
 
-  // Step 3: Package a full, real standard ZIP archive using JSZip
+  // -------------------------------------------------------------------------
+  // 3. Handle Remote URLs (Cloudinary, GitHub, CDN, Direct Server Link)
+  // -------------------------------------------------------------------------
+  if (project.fileUrl && (project.fileUrl.startsWith('http://') || project.fileUrl.startsWith('https://'))) {
+    let targetUrl = project.fileUrl;
+
+    // For Cloudinary image attachments (do NOT apply to /raw/ to avoid 400 errors)
+    if (targetUrl.includes('cloudinary.com') && targetUrl.includes('/image/upload/') && !targetUrl.includes('fl_attachment')) {
+      targetUrl = targetUrl.replace('/image/upload/', `/image/upload/fl_attachment:${encodeURIComponent(cleanFileName)}/`);
+    }
+
+    // Trigger immediate native browser download
+    triggerDirectUrlDownload(targetUrl, cleanFileName);
+    return;
+  }
+
+  // -------------------------------------------------------------------------
+  // 4. Generate structured fallback ZIP archive with JSZip
+  // -------------------------------------------------------------------------
   const zip = new JSZip();
 
-  // Create Project Structure
   const readmeContent = `# ${project.name} (v${project.version || '1.0.0'})
 Développeur: ${project.developerName || 'ORAX PROJET'}
 Catégorie: ${project.category}
@@ -80,12 +80,11 @@ ${(project.technologies || []).map((t) => `- ${t}`).join('\n')}
 ${(project.tags || []).map((t) => `#${t}`).join(' ')}
 
 ---
-Projet sécurisé et vérifié par ORAX PROJET.
+Projet sécurisé et vérifié par ORAX PROJET (LORD DEMON).
 `;
 
   zip.file('README.md', readmeContent);
 
-  // Generate source files based on project category
   const mainDir = zip.folder('src');
 
   if (project.category === 'bot' || project.category === 'script' || project.category === 'security') {
@@ -125,10 +124,9 @@ Projet sécurisé et vérifié par ORAX PROJET.
       'styles.css',
       `body {\n  margin: 0;\n  padding: 20px;\n  background-color: #0d1117;\n  color: #c9d1d9;\n  font-family: system-ui, -apple-system, sans-serif;\n}`
     );
-    mainDir?.file('app.js', `console.log("${project.name} chargé.");`);
+    mainDir?.file('app.js', `console.log("${project.name} initialisé.");`);
   }
 
-  // Metadata descriptor
   zip.file(
     'orax-manifest.json',
     JSON.stringify(
@@ -146,7 +144,6 @@ Projet sécurisé et vérifié par ORAX PROJET.
     )
   );
 
-  // Generate the binary blob
   const zipBlob = await zip.generateAsync({
     type: 'blob',
     mimeType: 'application/zip',
@@ -160,44 +157,107 @@ Projet sécurisé et vérifié par ORAX PROJET.
 }
 
 /**
- * Triggers native browser file download of a Blob
+ * Robust Direct URL Downloader for Remote Files
+ * Uses anchor injection with iframe fallback to prevent browser popup blockers.
  */
-export function downloadBlobDirectly(blob: Blob, fileName: string): void {
-  // Ensure blob has binary type
-  const finalBlob = blob.type ? blob : new Blob([blob], { type: 'application/zip' });
-  const blobUrl = window.URL.createObjectURL(finalBlob);
-
+export function triggerDirectUrlDownload(url: string, fileName: string): void {
+  // Method 1: Inject link with download attribute
   const anchor = document.createElement('a');
-  anchor.href = blobUrl;
+  anchor.href = url;
   anchor.download = fileName;
+  anchor.setAttribute('download', fileName);
+  anchor.target = '_blank';
+  anchor.rel = 'noopener noreferrer';
   anchor.style.position = 'fixed';
   anchor.style.left = '-9999px';
   anchor.style.top = '-9999px';
+  anchor.style.width = '1px';
+  anchor.style.height = '1px';
   anchor.style.opacity = '0';
   document.body.appendChild(anchor);
 
-  // Dispatch click event
   try {
-    anchor.dispatchEvent(
-      new MouseEvent('click', {
-        bubbles: true,
-        cancelable: true,
-        view: window,
-      })
-    );
-  } catch {
     anchor.click();
+  } catch {
+    // Method 2: window.open fallback
+    try {
+      window.open(url, '_blank');
+    } catch {
+      window.location.href = url;
+    }
   }
 
-  // Keep Blob URL active long enough for mobile download managers
+  // Method 3: Hidden iframe for mobile browsers that ignore anchor clicks on direct download streams
+  try {
+    const iframe = document.createElement('iframe');
+    iframe.style.display = 'none';
+    iframe.src = url;
+    document.body.appendChild(iframe);
+    setTimeout(() => {
+      try {
+        document.body.removeChild(iframe);
+      } catch {}
+    }, 15000);
+  } catch {}
+
   setTimeout(() => {
     try {
       document.body.removeChild(anchor);
-      window.URL.revokeObjectURL(blobUrl);
-    } catch {
-      // Ignored
+    } catch {}
+  }, 10000);
+}
+
+/**
+ * Triggers native browser file download of a Blob with cross-platform support
+ */
+export function downloadBlobDirectly(blob: Blob, fileName: string): void {
+  const finalBlob = blob.type ? blob : new Blob([blob], { type: 'application/zip' });
+
+  try {
+    const blobUrl = window.URL.createObjectURL(finalBlob);
+    const anchor = document.createElement('a');
+    anchor.href = blobUrl;
+    anchor.download = fileName;
+    anchor.setAttribute('download', fileName);
+    anchor.style.position = 'fixed';
+    anchor.style.left = '-9999px';
+    anchor.style.top = '-9999px';
+    anchor.style.width = '1px';
+    anchor.style.height = '1px';
+    anchor.style.opacity = '0';
+    document.body.appendChild(anchor);
+
+    anchor.click();
+
+    setTimeout(() => {
+      try {
+        document.body.removeChild(anchor);
+        window.URL.revokeObjectURL(blobUrl);
+      } catch {}
+    }, 45000);
+  } catch (err) {
+    // Fallback: convert to Base64 Data URL
+    try {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result as string;
+        const anchor = document.createElement('a');
+        anchor.href = dataUrl;
+        anchor.download = fileName;
+        anchor.setAttribute('download', fileName);
+        document.body.appendChild(anchor);
+        anchor.click();
+        setTimeout(() => {
+          try {
+            document.body.removeChild(anchor);
+          } catch {}
+        }, 10000);
+      };
+      reader.readAsDataURL(finalBlob);
+    } catch (readErr) {
+      console.error('Download mechanism error:', readErr);
     }
-  }, 45000);
+  }
 }
 
 function dataUrlToBlob(dataUrl: string): Blob {

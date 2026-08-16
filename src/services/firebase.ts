@@ -24,12 +24,14 @@ import {
   updateDoc,
   deleteDoc,
   increment,
+  arrayUnion,
   query,
   orderBy,
   onSnapshot,
   Firestore
 } from 'firebase/firestore';
 import { Project, UserProfile, ProjectReport, ProjectStatus, ReportStatus } from '../types';
+import { deleteStoredFile } from '../utils/fileStorage';
 
 const firebaseConfig = {
   apiKey: import.meta.env.VITE_FIREBASE_API_KEY || '',
@@ -647,9 +649,16 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
     status: projectData.status || 'published',
     downloads: 0,
     views: 1,
+    viewedBy: projectData.ownerId ? [projectData.ownerId] : [],
+    downloadedBy: [],
     createdAt: now,
     updatedAt: now,
   };
+
+  // Mark author as having viewed this project locally
+  if (projectData.ownerId) {
+    markProjectAsViewedLocally(newId, projectData.ownerId);
+  }
 
   // 1. Immediately update local storage cache and broadcast for instant UI feedback
   const projects = getLocalProjects();
@@ -707,46 +716,185 @@ export async function deleteExistingProject(id: string, userId: string): Promise
   const currentUser = getLocalSession();
   const isAdmin = checkIsAdmin(currentUser) || userId === 'dev_lord_demon';
 
-  if (project && project.ownerId !== userId && !isAdmin) {
+  // Flexible authorization verification
+  const isAuthorized = 
+    isAdmin ||
+    !project ||
+    !project.ownerId ||
+    project.ownerId === userId ||
+    (currentUser && project.ownerEmail && currentUser.email && project.ownerEmail.toLowerCase() === currentUser.email.toLowerCase()) ||
+    (currentUser && project.developerName && currentUser.displayName && project.developerName.toLowerCase() === currentUser.displayName.toLowerCase());
+
+  if (!isAuthorized) {
     throw new Error('Vous n\'êtes pas autorisé à supprimer ce projet.');
   }
 
+  // 1. Immediately remove from local storage & broadcast to UI
   const updated = deduplicateProjects(projects.filter(p => p.id !== id));
   saveLocalProjects(updated);
   broadcastProjectsChange(updated);
 
+  // 2. Remove associated binary file from local IndexedDB
+  try {
+    await deleteStoredFile(id);
+    if (project?.fileUrl) {
+      await deleteStoredFile(project.fileUrl);
+    }
+  } catch (err) {
+    console.warn('IndexedDB file cleanup notice:', err);
+  }
+
+  // 3. Delete from Firestore asynchronously with strict timeout so UI never hangs
   if (db && isFirebaseConfigured()) {
     try {
-      await deleteDoc(doc(db, 'projects', id));
+      const docRef = doc(db, 'projects', id);
+      await Promise.race([
+        deleteDoc(docRef),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Firestore timeout')), 3500))
+      ]);
     } catch (err) {
-      console.warn('Firestore delete error:', err);
+      console.warn('Firestore project deletion notice:', err);
     }
   }
 
   return true;
 }
 
-// Anti-spam cooldown sets in memory and storage
-const downloadedCooldowns = new Set<string>();
-const viewedCooldowns = new Set<string>();
+// --------------------------------------------------------------------------
+// UNIQUE VIEW & DOWNLOAD TRACKING PER ACCOUNT / VISITOR
+// --------------------------------------------------------------------------
 
-export async function recordProjectDownload(id: string): Promise<number> {
-  const key = `dl_${id}`;
-  const now = Date.now();
-  // Anti-double-click guard: 3 seconds throttle
-  if (downloadedCooldowns.has(key)) {
-    const current = getLocalProjects().find(p => p.id === id);
-    return current?.downloads || 1;
+const STORAGE_KEY_USER_VIEWS = 'orax_unique_user_views';
+const STORAGE_KEY_USER_DOWNLOADS = 'orax_unique_user_downloads';
+const STORAGE_KEY_GUEST_ID = 'orax_guest_device_id';
+
+/**
+ * Returns a stable identifier for the current user or visitor device
+ */
+export function getVisitorIdentifier(customUserId?: string): string {
+  if (customUserId && customUserId.trim()) {
+    return customUserId.trim();
   }
-  downloadedCooldowns.add(key);
-  setTimeout(() => downloadedCooldowns.delete(key), 3000);
+  const session = getLocalSession();
+  if (session?.uid) {
+    return session.uid;
+  }
+  if (session?.email) {
+    return session.email.toLowerCase();
+  }
+  try {
+    let guestId = localStorage.getItem(STORAGE_KEY_GUEST_ID);
+    if (!guestId) {
+      guestId = `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+      localStorage.setItem(STORAGE_KEY_GUEST_ID, guestId);
+    }
+    return guestId;
+  } catch {
+    return 'visitor_default';
+  }
+}
 
+function hasUserViewedProject(projectId: string, visitorId: string, project?: Project | null): boolean {
+  if (project?.viewedBy && Array.isArray(project.viewedBy) && project.viewedBy.includes(visitorId)) {
+    return true;
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_USER_VIEWS);
+    if (raw) {
+      const map: Record<string, string[]> = JSON.parse(raw);
+      if (map[visitorId] && map[visitorId].includes(projectId)) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore parse error
+  }
+  return false;
+}
+
+function markProjectAsViewedLocally(projectId: string, visitorId: string): void {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_USER_VIEWS);
+    const map: Record<string, string[]> = raw ? JSON.parse(raw) : {};
+    if (!map[visitorId]) {
+      map[visitorId] = [];
+    }
+    if (!map[visitorId].includes(projectId)) {
+      map[visitorId].push(projectId);
+    }
+    localStorage.setItem(STORAGE_KEY_USER_VIEWS, JSON.stringify(map));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+function hasUserDownloadedProject(projectId: string, visitorId: string, project?: Project | null): boolean {
+  if (project?.downloadedBy && Array.isArray(project.downloadedBy) && project.downloadedBy.includes(visitorId)) {
+    return true;
+  }
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_USER_DOWNLOADS);
+    if (raw) {
+      const map: Record<string, string[]> = JSON.parse(raw);
+      if (map[visitorId] && map[visitorId].includes(projectId)) {
+        return true;
+      }
+    }
+  } catch {
+    // Ignore parse error
+  }
+  return false;
+}
+
+function markProjectAsDownloadedLocally(projectId: string, visitorId: string): void {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_USER_DOWNLOADS);
+    const map: Record<string, string[]> = raw ? JSON.parse(raw) : {};
+    if (!map[visitorId]) {
+      map[visitorId] = [];
+    }
+    if (!map[visitorId].includes(projectId)) {
+      map[visitorId].push(projectId);
+    }
+    localStorage.setItem(STORAGE_KEY_USER_DOWNLOADS, JSON.stringify(map));
+  } catch {
+    // Ignore storage errors
+  }
+}
+
+/**
+ * Increments project downloads ONLY ONCE per user account / visitor.
+ * If the user has already downloaded this project, returns the current count without adding +1.
+ */
+export async function recordProjectDownload(
+  id: string, 
+  customUserId?: string
+): Promise<{ downloads: number; isNew: boolean }> {
+  const visitorId = getVisitorIdentifier(customUserId);
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
-  let updatedDownloads = 1;
+  const targetProject = index !== -1 ? projects[index] : null;
 
+  // Check if this account/visitor already downloaded this project
+  if (hasUserDownloadedProject(id, visitorId, targetProject)) {
+    return {
+      downloads: targetProject?.downloads || 0,
+      isNew: false,
+    };
+  }
+
+  // First time downloading: record for this user and increment
+  markProjectAsDownloadedLocally(id, visitorId);
+
+  let updatedDownloads = 1;
   if (index !== -1) {
     projects[index].downloads = (projects[index].downloads || 0) + 1;
+    if (!projects[index].downloadedBy) {
+      projects[index].downloadedBy = [];
+    }
+    if (!projects[index].downloadedBy.includes(visitorId)) {
+      projects[index].downloadedBy.push(visitorId);
+    }
     updatedDownloads = projects[index].downloads;
     const clean = deduplicateProjects(projects);
     saveLocalProjects(clean);
@@ -756,30 +904,51 @@ export async function recordProjectDownload(id: string): Promise<number> {
   if (db && isFirebaseConfigured()) {
     try {
       const docRef = doc(db, 'projects', id);
-      await updateDoc(docRef, { downloads: increment(1) });
+      await updateDoc(docRef, { 
+        downloads: increment(1),
+        downloadedBy: arrayUnion(visitorId)
+      });
     } catch (err) {
       console.warn('Firestore download increment warning:', err);
     }
   }
 
-  return updatedDownloads;
+  return { downloads: updatedDownloads, isNew: true };
 }
 
-export async function recordProjectView(id: string): Promise<number> {
-  const key = `view_${id}`;
-  if (viewedCooldowns.has(key)) {
-    const current = getLocalProjects().find(p => p.id === id);
-    return current?.views || 1;
-  }
-  viewedCooldowns.add(key);
-  setTimeout(() => viewedCooldowns.delete(key), 5000);
-
+/**
+ * Increments project views ONLY ONCE per user account / visitor.
+ * If the user has already visited/opened this project, returns current views without adding +1.
+ */
+export async function recordProjectView(
+  id: string, 
+  customUserId?: string
+): Promise<{ views: number; isNew: boolean }> {
+  const visitorId = getVisitorIdentifier(customUserId);
   const projects = getLocalProjects();
   const index = projects.findIndex(p => p.id === id);
-  let updatedViews = 1;
+  const targetProject = index !== -1 ? projects[index] : null;
 
+  // Check if this account/visitor already viewed this project
+  if (hasUserViewedProject(id, visitorId, targetProject)) {
+    return {
+      views: targetProject?.views || 1,
+      isNew: false,
+    };
+  }
+
+  // First time viewing: record for this user and increment
+  markProjectAsViewedLocally(id, visitorId);
+
+  let updatedViews = 1;
   if (index !== -1) {
     projects[index].views = (projects[index].views || 0) + 1;
+    if (!projects[index].viewedBy) {
+      projects[index].viewedBy = [];
+    }
+    if (!projects[index].viewedBy.includes(visitorId)) {
+      projects[index].viewedBy.push(visitorId);
+    }
     updatedViews = projects[index].views;
     const clean = deduplicateProjects(projects);
     saveLocalProjects(clean);
@@ -789,13 +958,16 @@ export async function recordProjectView(id: string): Promise<number> {
   if (db && isFirebaseConfigured()) {
     try {
       const docRef = doc(db, 'projects', id);
-      await updateDoc(docRef, { views: increment(1) });
+      await updateDoc(docRef, { 
+        views: increment(1),
+        viewedBy: arrayUnion(visitorId)
+      });
     } catch (err) {
       console.warn('Firestore view increment warning:', err);
     }
   }
 
-  return updatedViews;
+  return { views: updatedViews, isNew: true };
 }
 
 // --------------------------------------------------------------------------

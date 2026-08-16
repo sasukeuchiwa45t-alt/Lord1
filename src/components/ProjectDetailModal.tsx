@@ -55,22 +55,22 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
 
   useEffect(() => {
     if (project) {
-      setCurrentDownloads(project.downloads);
-      setCurrentViews(project.views);
+      setCurrentDownloads(project.downloads || 0);
+      setCurrentViews(project.views || 0);
     }
   }, [project?.downloads, project?.views]);
 
   useEffect(() => {
     if (project) {
-      // Record view count automatically when the project modal is opened
-      recordProjectView(project.id).then((newViews) => {
-        setCurrentViews(newViews);
-        if (onProjectUpdated) {
-          onProjectUpdated({ ...project, views: newViews });
+      // Record view count strictly once per user account / visitor
+      recordProjectView(project.id, currentUser?.uid).then((res) => {
+        setCurrentViews(res.views);
+        if (onProjectUpdated && res.isNew) {
+          onProjectUpdated({ ...project, views: res.views });
         }
       });
     }
-  }, [project?.id]);
+  }, [project?.id, currentUser?.uid]);
 
   if (!project) return null;
 
@@ -96,13 +96,16 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
     setDownloading(true);
 
     showToast({
-      title: 'Téléchargement commencé...',
-      message: `Téléchargement du fichier ${project.fileName || project.name} sur votre appareil`,
+      title: 'Téléchargement lancé...',
+      message: `Enregistrement du fichier ${project.fileName || project.name} sur votre appareil`,
       type: 'info',
     });
 
     try {
-      // Fire celebratory confetti
+      // 1. Immediately trigger the binary/archive download to preserve user activation gesture
+      const downloadPromise = triggerProjectDownload(project);
+
+      // 2. Fire celebratory confetti
       try {
         confetti({
           particleCount: 50,
@@ -110,27 +113,27 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           origin: { y: 0.7 },
         });
       } catch {
-        // Ignore confetti error if canvas not supported
+        // Ignore confetti error
       }
 
-      // Record download increment
-      const updatedCount = await recordProjectDownload(project.id);
-      setCurrentDownloads(updatedCount);
-      if (onProjectUpdated) {
-        onProjectUpdated({ ...project, downloads: updatedCount });
-      }
+      // 3. Record unique account download in parallel
+      recordProjectDownload(project.id, currentUser?.uid).then((res) => {
+        setCurrentDownloads(res.downloads);
+        if (onProjectUpdated && res.isNew) {
+          onProjectUpdated({ ...project, downloads: res.downloads });
+        }
+      });
 
-      // Trigger real device download into Android/iOS/Desktop local storage
-      await triggerProjectDownload(project);
+      await downloadPromise;
 
       setTimeout(() => {
         setDownloading(false);
         showToast({
           title: 'Téléchargement réussi !',
-          message: 'Le fichier du projet a été enregistré sur votre appareil.',
+          message: `Le fichier "${project.fileName || project.name}" a été transmis à votre gestionnaire de téléchargements.`,
           type: 'success',
         });
-      }, 1000);
+      }, 800);
     } catch (err: any) {
       setDownloading(false);
       showToast({
@@ -360,18 +363,44 @@ export const ProjectDetailModal: React.FC<ProjectDetailModalProps> = ({
           )}
 
           {/* File details container */}
-          <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 text-xs font-mono text-zinc-400 space-y-1.5">
-            <div className="flex justify-between">
+          <div className="p-4 rounded-xl bg-zinc-950 border border-zinc-800 text-xs font-mono text-zinc-400 space-y-2">
+            <div className="flex justify-between items-center">
               <span>Nom du fichier archive :</span>
-              <span className="text-zinc-200 font-semibold">{project.fileName}</span>
+              <span className="text-zinc-200 font-semibold truncate max-w-[200px]">{project.fileName}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify-between items-center">
               <span>Poids du téléchargement :</span>
               <span className="text-cyan-400">{formatFileSize(project.fileSize)}</span>
             </div>
-            <div className="flex justify-between">
+            <div className="flex justify-between items-center">
               <span>Dernière mise à jour :</span>
               <span className="text-zinc-300">{formatDate(project.updatedAt)}</span>
+            </div>
+
+            {/* Direct Link Alternate Trigger */}
+            <div className="pt-2 border-t border-zinc-800/80 flex items-center justify-between">
+              <span className="text-[11px] text-zinc-500 font-sans">Lien de secours direct :</span>
+              {project.fileUrl && (project.fileUrl.startsWith('http://') || project.fileUrl.startsWith('https://')) ? (
+                <a
+                  href={project.fileUrl}
+                  download={project.fileName}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs text-cyan-400 hover:text-cyan-300 underline font-sans flex items-center gap-1"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Téléchargement direct</span>
+                </a>
+              ) : (
+                <button
+                  type="button"
+                  onClick={handleDownload}
+                  className="text-xs text-cyan-400 hover:text-cyan-300 underline font-sans flex items-center gap-1"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Lancer l'archive</span>
+                </button>
+              )}
             </div>
           </div>
 
