@@ -26,7 +26,8 @@ import {
   getPaginatedProjects,
   subscribeToProjects,
   subscribeToAuth, 
-  logoutUser 
+  logoutUser,
+  deduplicateProjects
 } from './services/firebase';
 import { 
   Flame, 
@@ -83,7 +84,7 @@ function MainApp() {
     setLoadingProjects(true);
 
     const unsubscribeProjects = subscribeToProjects((liveProjects) => {
-      setProjects(liveProjects);
+      setProjects(deduplicateProjects(liveProjects));
       setLoadingProjects(false);
     });
 
@@ -119,7 +120,7 @@ function MainApp() {
 
   // Visible projects for normal users (filters out hidden projects unless owner or admin)
   const visibleProjects = useMemo(() => {
-    return projects.filter(p => {
+    return deduplicateProjects(projects).filter(p => {
       if (isAdmin) return true;
       if (p.status === 'hidden') {
         return currentUser && (currentUser.uid === p.ownerId || currentUser.uid === 'dev_lord_demon');
@@ -215,12 +216,12 @@ function MainApp() {
 
   const userProjects = useMemo(() => {
     if (!currentUser) return [];
-    return projects.filter((p) => p.ownerId === currentUser.uid || (currentUser.uid === 'dev_lord_demon' && p.developerName.toUpperCase().includes('LORD DEMON')));
+    return deduplicateProjects(projects).filter((p) => p.ownerId === currentUser.uid || (currentUser.uid === 'dev_lord_demon' && p.developerName.toUpperCase().includes('LORD DEMON')));
   }, [projects, currentUser]);
 
   // Overall platform metrics
   const totalDownloads = useMemo(() => {
-    return projects.reduce((acc, curr) => acc + (curr.downloads || 0), 0);
+    return deduplicateProjects(projects).reduce((acc, curr) => acc + (curr.downloads || 0), 0);
   }, [projects]);
 
   // Handlers
@@ -254,19 +255,19 @@ function MainApp() {
   };
 
   const handleProjectPublished = (newProj: Project) => {
-    setProjects((prev) => [newProj, ...prev]);
+    setProjects((prev) => deduplicateProjects([newProj, ...prev]));
     setSelectedProject(newProj);
   };
 
   const handleProjectUpdated = (updatedProj: Project) => {
-    setProjects((prev) => prev.map((p) => (p.id === updatedProj.id ? updatedProj : p)));
+    setProjects((prev) => deduplicateProjects(prev.map((p) => (p.id === updatedProj.id ? updatedProj : p))));
     if (selectedProject?.id === updatedProj.id) {
       setSelectedProject(updatedProj);
     }
   };
 
   const handleProjectDeleted = (id: string) => {
-    setProjects((prev) => prev.filter((p) => p.id !== id));
+    setProjects((prev) => deduplicateProjects(prev.filter((p) => p.id !== id)));
     if (selectedProject?.id === id) {
       setSelectedProject(null);
     }

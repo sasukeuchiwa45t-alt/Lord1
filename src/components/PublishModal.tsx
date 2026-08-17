@@ -193,14 +193,12 @@ export const PublishModal: React.FC<PublishModalProps> = ({
         featured: false,
       });
 
-      // 3. Store binary file in IndexedDB for immediate, reliable device downloading
-      try {
-        await saveFileToIndexedDB(newProject.id, projectFile, projectFile.name);
-        if (uploadResult.url) {
-          await saveFileToIndexedDB(uploadResult.url, projectFile, projectFile.name);
-        }
-      } catch (idbErr) {
+      // 3. Store binary file in IndexedDB asynchronously without blocking the user
+      saveFileToIndexedDB(newProject.id, projectFile, projectFile.name).catch((idbErr) => {
         console.warn('IndexedDB save warning:', idbErr);
+      });
+      if (uploadResult.url) {
+        saveFileToIndexedDB(uploadResult.url, projectFile, projectFile.name).catch(() => {});
       }
 
       setIsUploading(false);

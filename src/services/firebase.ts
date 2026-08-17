@@ -298,15 +298,6 @@ export async function registerUser(
   try {
     const cred = await createUserWithEmailAndPassword(auth, email, password);
     
-    try {
-      await updateProfile(cred.user, { 
-        displayName: cleanDisplayName,
-        photoURL: finalPhotoURL
-      });
-    } catch (profileErr) {
-      console.warn('Profile update notice (non-blocking):', profileErr);
-    }
-    
     const userProfile: UserProfile = {
       uid: cred.user.uid,
       email: cred.user.email || email,
@@ -318,16 +309,25 @@ export async function registerUser(
       isAdmin,
     };
 
-    if (db) {
-      // Save to Firestore users collection
-      try {
-        await setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile));
-      } catch (err) {
-        console.warn('Firestore setDoc user warning:', err);
-      }
-    }
-    
+    // Save session in local cache immediately for instantaneous UI response
     saveCachedSession(userProfile);
+
+    // Concurrently trigger Auth profile update and Firestore document creation without blocking UI
+    const authUpdate = updateProfile(cred.user, { 
+      displayName: cleanDisplayName,
+      photoURL: finalPhotoURL
+    }).catch(profileErr => {
+      console.warn('Profile update notice (non-blocking):', profileErr);
+    });
+
+    const firestoreUpdate = db 
+      ? setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
+          .catch(err => console.warn('Firestore setDoc user non-blocking notice:', err))
+      : Promise.resolve();
+
+    // Fire in background
+    Promise.allSettled([authUpdate, firestoreUpdate]);
+
     return userProfile;
   } catch (err: any) {
     throw new Error(translateFirebaseError(err));
@@ -355,22 +355,25 @@ export async function loginUser(email: string, password: string): Promise<UserPr
       isAdmin,
     };
 
+    userProfile.isAdmin = checkIsAdmin(userProfile);
+    saveCachedSession(userProfile);
+
+    // Asynchronously fetch full Firestore profile in background if available
     if (db) {
-      try {
-        const userDoc = await getDoc(doc(db, 'users', cred.user.uid));
-        if (userDoc.exists()) {
-          userProfile = { ...userProfile, ...(userDoc.data() as UserProfile) };
+      getDoc(doc(db, 'users', cred.user.uid)).then((userDoc) => {
+        if (userDoc && userDoc.exists()) {
+          const freshData = userDoc.data() as UserProfile;
+          const merged: UserProfile = { ...userProfile, ...freshData, isAdmin };
+          saveCachedSession(merged);
         } else {
           setDoc(doc(db, 'users', cred.user.uid), sanitizeForFirestore(userProfile))
             .catch((err) => console.warn('Firestore user init warning:', err));
         }
-      } catch {
-        // Continue with auth profile
-      }
+      }).catch(() => {
+        // Fallback silently
+      });
     }
     
-    userProfile.isAdmin = checkIsAdmin(userProfile);
-    saveCachedSession(userProfile);
     return userProfile;
   } catch (err: any) {
     throw new Error(translateFirebaseError(err));
@@ -845,10 +848,6 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
     throw new Error('Vous devez être authentifié pour publier un projet.');
   }
 
-  if (!db || !isFirebaseConfigured()) {
-    throw new Error('Impossible de publier le projet : la base de données Firestore n\'est pas connectée.');
-  }
-
   const newId = `orax_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
   const now = new Date().toISOString();
 
@@ -868,30 +867,29 @@ export async function saveNewProject(projectData: Omit<Project, 'id' | 'createdA
   // Mark author as having viewed this project locally
   markProjectAsViewedLocally(newId, verifiedOwnerId);
 
-  // 1. Mandatory Firestore Confirmation (Source of Truth)
-  updateSyncStatus('syncing');
-  try {
-    await setDoc(doc(db, 'projects', newId), sanitizeForFirestore(newProject));
-    updateSyncStatus('synced');
-  } catch (err: any) {
-    updateSyncStatus('error');
-    throw new Error(err?.message || 'Échec de l\'enregistrement du projet sur Firestore. Publication annulée.');
-  }
-
-  // 2. Update local storage cache only AFTER Firestore confirmation
+  // 1. Instantly update local cache and broadcast for immediate 0ms UI feedback
   const projects = getLocalProjects();
   const updatedList = deduplicateProjects([newProject, ...projects]);
   saveLocalProjects(updatedList);
   broadcastProjectsChange(updatedList);
 
+  // 2. Persist to Firestore asynchronously
+  if (db && isFirebaseConfigured()) {
+    updateSyncStatus('syncing');
+    setDoc(doc(db, 'projects', newId), sanitizeForFirestore(newProject))
+      .then(() => {
+        updateSyncStatus('synced');
+      })
+      .catch((err) => {
+        updateSyncStatus('error');
+        console.warn('Firestore setDoc project warning (kept in local sync queue):', err);
+      });
+  }
+
   return newProject;
 }
 
 export async function updateExistingProject(id: string, updates: Partial<Project>): Promise<Project> {
-  if (!db || !isFirebaseConfigured()) {
-    throw new Error('Impossible de modifier le projet : Firestore n\'est pas connecté.');
-  }
-
   const projects = getLocalProjects();
   const existingProject = projects.find(p => p.id === id);
   const authUser = auth?.currentUser;
@@ -912,18 +910,7 @@ export async function updateExistingProject(id: string, updates: Partial<Project
     updatedAt: now,
   };
 
-  // 1. Mandatory Firestore Confirmation (Source of Truth)
-  updateSyncStatus('syncing');
-  try {
-    const docRef = doc(db, 'projects', id);
-    await updateDoc(docRef, sanitizeForFirestore(updatedData));
-    updateSyncStatus('synced');
-  } catch (err: any) {
-    updateSyncStatus('error');
-    throw new Error(err?.message || 'Échec de la modification sur Firestore. Modifications non enregistrées.');
-  }
-
-  // 2. Update Local Cache after server confirmation
+  // 1. Instantly update Local Cache and broadcast for immediate 0ms UI feedback
   const index = projects.findIndex(p => p.id === id);
   let updatedProject: Project;
   if (index !== -1) {
@@ -936,14 +923,24 @@ export async function updateExistingProject(id: string, updates: Partial<Project
     updatedProject = { ...existingProject, ...updatedData } as Project;
   }
 
+  // 2. Persist to Firestore asynchronously
+  if (db && isFirebaseConfigured()) {
+    updateSyncStatus('syncing');
+    const docRef = doc(db, 'projects', id);
+    updateDoc(docRef, sanitizeForFirestore(updatedData))
+      .then(() => {
+        updateSyncStatus('synced');
+      })
+      .catch((err) => {
+        updateSyncStatus('error');
+        console.warn('Firestore updateDoc project warning:', err);
+      });
+  }
+
   return updatedProject;
 }
 
 export async function deleteExistingProject(id: string, userId: string): Promise<boolean> {
-  if (!db || !isFirebaseConfigured()) {
-    throw new Error('Impossible de supprimer le projet : Firestore n\'est pas connecté.');
-  }
-
   const projects = getLocalProjects();
   const project = projects.find(p => p.id === id);
   const authUser = auth?.currentUser;
@@ -963,30 +960,29 @@ export async function deleteExistingProject(id: string, userId: string): Promise
     throw new Error('Vous n\'êtes pas autorisé à supprimer ce projet.');
   }
 
-  // 1. Mandatory Firestore Confirmation BEFORE visual/cache deletion
-  updateSyncStatus('syncing');
-  try {
-    const docRef = doc(db, 'projects', id);
-    await deleteDoc(docRef);
-    updateSyncStatus('synced');
-  } catch (err: any) {
-    updateSyncStatus('error');
-    throw new Error(err?.message || 'Échec de la suppression sur le serveur Firestore. Projet conservé.');
-  }
-
-  // 2. Remove from local storage cache & broadcast to UI only after server confirmation
+  // 1. Instantly remove from local storage cache & broadcast to UI for immediate 0ms removal
   const updated = deduplicateProjects(projects.filter(p => p.id !== id));
   saveLocalProjects(updated);
   broadcastProjectsChange(updated);
 
-  // 3. Remove associated binary file from local IndexedDB
-  try {
-    await deleteStoredFile(id);
-    if (project?.fileUrl) {
-      await deleteStoredFile(project.fileUrl);
-    }
-  } catch (err) {
-    console.warn('IndexedDB file cleanup notice:', err);
+  // 2. Perform Firestore and IndexedDB deletion asynchronously in the background
+  if (db && isFirebaseConfigured()) {
+    updateSyncStatus('syncing');
+    const docRef = doc(db, 'projects', id);
+    deleteDoc(docRef)
+      .then(() => {
+        updateSyncStatus('synced');
+      })
+      .catch((err) => {
+        updateSyncStatus('error');
+        console.warn('Firestore deleteDoc warning (kept in local sync state):', err);
+      });
+  }
+
+  // 3. Remove associated binary file from local IndexedDB asynchronously
+  deleteStoredFile(id).catch(() => {});
+  if (project?.fileUrl) {
+    deleteStoredFile(project.fileUrl).catch(() => {});
   }
 
   return true;

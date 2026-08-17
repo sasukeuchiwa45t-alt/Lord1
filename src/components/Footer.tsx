@@ -110,7 +110,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate, onSelectCategory }) 
                   }}
                   className="hover:text-cyan-400 transition-colors flex items-center gap-1.5"
                 >
-                  🤖 Bots & Automatisation
+                  🤖 Bots & Scripts
                 </button>
               </li>
               <li>
@@ -121,7 +121,7 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate, onSelectCategory }) 
                   }}
                   className="hover:text-cyan-400 transition-colors flex items-center gap-1.5"
                 >
-                  🔐 Cybersécurité & Pentest
+                  🔐 Cybersécurité
                 </button>
               </li>
               <li>
@@ -143,19 +143,53 @@ export const Footer: React.FC<FooterProps> = ({ onNavigate, onSelectCategory }) 
                   }}
                   className="hover:text-cyan-400 transition-colors flex items-center gap-1.5"
                 >
-                  🌐 Sites Web & APIs
+                  🌐 Sites & APIs
                 </button>
               </li>
+            </ul>
+          </div>
+
+          {/* Col 4: Communauté Officielle & Réseaux */}
+          <div>
+            <h4 className="text-sm font-semibold text-white uppercase tracking-wider mb-4 font-mono">
+              Communauté
+            </h4>
+            <ul className="space-y-2.5 text-sm">
               <li>
-                <button 
-                  onClick={() => {
-                    onNavigate('projects');
-                    if (onSelectCategory) onSelectCategory('mobile');
-                  }}
-                  className="hover:text-cyan-400 transition-colors flex items-center gap-1.5"
+                <a
+                  href="https://t.me/nexusforger"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-sky-400 transition-colors flex items-center gap-2 group text-zinc-300"
                 >
-                  📱 Applications Mobiles
-                </button>
+                  <span className="w-2 h-2 rounded-full bg-sky-400 group-hover:scale-125 transition-transform" />
+                  <span>Canal Télégram</span>
+                  <ExternalLink className="w-3 h-3 text-zinc-500 group-hover:text-sky-400" />
+                </a>
+              </li>
+              <li>
+                <a
+                  href="https://whatsapp.com/channel/0029Vb7EMRIEFeXqc72cRk1N"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-emerald-400 transition-colors flex items-center gap-2 group text-zinc-300"
+                >
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 group-hover:scale-125 transition-transform" />
+                  <span>Chaîne WhatsApp</span>
+                  <ExternalLink className="w-3 h-3 text-zinc-500 group-hover:text-emerald-400" />
+                </a>
+              </li>
+              <li>
+                <a
+                  href="https://chat.whatsapp.com/JY9P9mO9DBe8R6i7Oc93Dt?s=cl&p=a&ilr=0"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="hover:text-green-400 transition-colors flex items-center gap-2 group text-zinc-300"
+                >
+                  <span className="w-2 h-2 rounded-full bg-green-500 group-hover:scale-125 transition-transform" />
+                  <span>Groupe WhatsApp Dev</span>
+                  <ExternalLink className="w-3 h-3 text-zinc-500 group-hover:text-green-400" />
+                </a>
               </li>
             </ul>
           </div>
